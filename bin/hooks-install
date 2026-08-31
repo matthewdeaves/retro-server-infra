@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#
+# Point git at the hooks in this repo.
+#
+# Git does not clone hooks — they live in .git/hooks, which is not versioned —
+# so a fresh checkout has none until this is run. core.hooksPath makes git use
+# the tracked directory directly, which means an edit to hooks/pre-commit takes
+# effect for everyone without anyone reinstalling anything.
+#
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+chmod +x "$root/hooks/"* "$root/bin/"*
+git config core.hooksPath hooks
+echo "hooks installed: git will now run bin/check before every commit"
+echo "bypass a single commit with: git commit --no-verify"

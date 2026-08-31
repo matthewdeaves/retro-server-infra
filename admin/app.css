@@ -1,0 +1,1294 @@
+/* Retro servers — admin UI.
+ *
+ * Direction: an instrument panel, not a dashboard. These are four id-Software
+ * deathmatch servers from 1996-99, driven mostly from a phone at a party, and
+ * the page's one job is "what is running, and change it in as few taps as
+ * possible". So: every number is monospace and tabular, every label is small
+ * uppercase equipment lettering, and every card belonging to a game carries
+ * that game's own colour on its left edge. The colour is not decoration — it
+ * tells you which server you are looking at before you have read a word.
+ *
+ * The one indulgence is the bay: icon, telemetry, and a picture of the level
+ * currently loaded, side by side, so the overview can be read at a glance and
+ * from arm's length.
+ *
+ * In its own file so that it can be linted, and so nothing in Python's string
+ * escaping can get at it.
+ */
+
+*, *::before, *::after { box-sizing: border-box }
+
+:root {
+  color-scheme: light dark;
+
+  /* Each game's own colour, taken off its logo. Quake amber, Quake II olive,
+     Quake III red, Half-Life HEV orange. */
+  --quake: #c67c22;
+  --quake2: #6f8f3e;
+  --quake3: #c0362c;
+  --halflife: #e07d0a;
+  --alephone: #2a82c4;
+
+  --bg: #eceae6;
+  --panel: #fffefc;
+  --sunk: #f5f3ef;
+  --line: #dcd8d0;
+  --edge: #c6c1b6;
+  --fg: #16171c;
+  --mut: #6a6e78;
+  --ok: #16714a;
+  --okbg: #e2f2e9;
+  --bad: #a92b20;
+  --badbg: #fbe9e6;
+  --warn: #8a6100;
+  --warnbg: #fbf0d8;
+
+  /* ONE interactive colour for the whole app. Every primary action, every
+     selected thing, every focus ring is this and nothing else.
+     It used to be --accent, which is the GAME's colour, so the same button was
+     amber on Quake and red on Quake II and the page looked like the colour
+     meant something. It did not.
+     Blue on purpose: it has to be distinguishable at a glance from the three
+     status colours, or a green primary button reads as "healthy" and a red
+     one as "broken" when both are just buttons. */
+  --team-red: #c0392b;
+  --team-blue: #2f6bb0;
+  --ui: #2f6bb0;
+  --ui-fg: #ffffff;
+  --ui-soft: #e8f0fa;
+
+  /* Game colour, kept for identity only — never on a control. */
+  --accent: var(--fg);
+
+  --shadow: 0 1px 1px rgba(20, 21, 26, .04), 0 3px 10px rgba(20, 21, 26, .05);
+  --lift: 0 2px 4px rgba(20, 21, 26, .06), 0 10px 26px rgba(20, 21, 26, .09);
+  --r: 14px;
+  --r-sm: 9px;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --quake: #e39c3c;
+    --quake2: #9ec062;
+    --quake3: #e05548;
+    --halflife: #ffa42a;
+    --alephone: #4da3e0;
+    --bg: #0d0e12;
+    --panel: #16181e;
+    --sunk: #1d2028;
+    --line: #272b34;
+    --edge: #353a45;
+    --fg: #eae8e3;
+    --mut: #9096a2;
+    --ok: #4fc490;
+    --okbg: #102e21;
+    --bad: #f08276;
+    --badbg: #331916;
+    --warn: #e0b25e;
+    --warnbg: #322611;
+    --team-red: #e8776a;
+    --team-blue: #6aa9e8;
+    --ui: #6aa9e8;
+    --ui-fg: #0a1420;
+    --ui-soft: #14212f;
+    --accent: var(--fg);
+    --shadow: 0 1px 0 rgba(255, 255, 255, .02);
+    --lift: 0 10px 30px rgba(0, 0, 0, .5);
+  }
+}
+
+html { -webkit-text-size-adjust: 100% }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  padding:
+    max(1rem, env(safe-area-inset-top))
+    max(1rem, env(safe-area-inset-right))
+    max(2.5rem, env(safe-area-inset-bottom))
+    max(1rem, env(safe-area-inset-left));
+}
+
+main { max-width: 37rem; margin: 0 auto }
+
+/* Focus that is actually visible, in the accent of whatever you are in. */
+:focus-visible {
+  outline: 2px solid var(--ui);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ------------------------------------------------------------------ header */
+
+header { margin: .1rem 0 1rem }
+
+h1 {
+  font-size: 1.36rem;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  margin: 0 0 .15rem;
+}
+
+.sub { color: var(--mut); font-size: .84rem; margin: 0; word-break: break-word }
+
+nav {
+  display: flex;
+  gap: .25rem;
+  overflow-x: auto;
+  margin: 0 -1rem 1rem;
+  padding: 0 1rem .5rem;
+  -webkit-overflow-scrolling: touch;
+  /* Visible on purpose, thin rather than hidden -- on a phone this is the
+     only hint there's more to scroll to once the game list runs past one
+     screen width. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+nav::-webkit-scrollbar { height: 5px }
+nav::-webkit-scrollbar-track { background: transparent }
+nav::-webkit-scrollbar-thumb { background: var(--line); border-radius: 99px }
+nav::-webkit-scrollbar-thumb:hover { background: var(--mut) }
+
+nav a {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  text-decoration: none;
+  color: var(--mut);
+  font-size: .84rem;
+  font-weight: 600;
+  padding: .4rem .7rem;
+  border-radius: 99px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+nav a.here { background: var(--panel); border-color: var(--line); color: var(--fg) }
+nav a img { width: 18px; height: 18px; border-radius: 4px; display: block }
+
+/* ------------------------------------------------------------------- cards */
+
+.card {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: .95rem 1rem;
+  margin-bottom: .8rem;
+  box-shadow: var(--shadow);
+}
+
+/* Equipment lettering. Used for every section label on the page. */
+.card h2 {
+  font: 700 .67rem/1 var(--sans);
+  text-transform: uppercase;
+  letter-spacing: .13em;
+  color: var(--mut);
+  margin: 0 0 .75rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: .5rem;
+}
+
+/* The right-hand slot of a heading is a live readout, so it is set as data
+   rather than as another label. */
+.card h2 > span + span,
+.card h2 > .live {
+  text-transform: none;
+  letter-spacing: 0;
+  font: 400 .78rem/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A tabpanel's own live readout, now that the tab label stands in for the
+   old h2 title -- same typography as the h2 data slot above, right-aligned,
+   no left-hand label since there's nothing left to balance it against. */
+.panel-meta {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 .75rem;
+  color: var(--mut);
+  font: 400 .78rem/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.stack { display: block }
+
+.flash {
+  border-radius: 12px;
+  padding: .7rem .9rem;
+  margin-bottom: .8rem;
+  font-size: .9rem;
+  border: 1px solid currentColor;
+}
+
+.flash.ok { background: var(--okbg); color: var(--ok) }
+.flash.err { background: var(--badbg); color: var(--bad) }
+
+/* ------------------------------------------------------- the access readout */
+
+.me { display: flex; align-items: center; gap: .55rem; flex-wrap: wrap; margin-bottom: .75rem }
+
+.pill {
+  font: 700 .66rem/1 var(--sans);
+  padding: .3rem .55rem;
+  border-radius: 99px;
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  white-space: nowrap;
+}
+
+.pill.on { background: var(--okbg); color: var(--ok) }
+.pill.off { background: var(--badbg); color: var(--bad) }
+.pill.warn { background: var(--warnbg); color: var(--warn) }
+
+/* The three verdicts, in one place. Anything with a status spine sets one of
+   these classes and nothing else needs to know the colours. */
+.up   { --status: var(--ok) }
+.warn { --status: var(--warn) }
+.down { --status: var(--bad) }
+
+/* ------------------------------------------------------------------- bays
+ *
+ * One per server. Icon, telemetry, and the level currently loaded where the
+ * game has a picture of it.
+ *
+ * The 4px spine on the left is STATUS, and only ever status. It used to be the
+ * game's own colour, which looked deliberate and meant nothing: a coloured
+ * left edge is a strong, conventional signal for state, so spending it on
+ * identity leaves nothing to say "this one is broken" with — and identity is
+ * already carried by the emblem and the name, twice over. Now green is up,
+ * amber is up-but-not-answering, red is stopped, and a page of green bays is
+ * a page you can stop reading.
+ */
+
+/* align-items: start, or a bay with three bots in it stretches the two next
+   to it into tall empty boxes. */
+.bays { display: grid; grid-template-columns: 1fr; gap: .6rem; align-items: start }
+
+.bay {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: .8rem;
+  padding: .75rem .85rem .75rem .95rem;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--status, var(--line));
+  border-radius: var(--r);
+  text-decoration: none;
+  color: inherit;
+  box-shadow: var(--shadow);
+  transition: box-shadow .16s ease, transform .16s ease;
+  overflow: hidden;
+}
+
+@media (hover: hover) {
+  .bay:hover { box-shadow: var(--lift); transform: translateY(-1px) }
+}
+
+.bay:active { transform: scale(.995) }
+
+.bay-icon {
+  width: 58px;
+  height: 58px;
+  border-radius: 12px;
+  object-fit: contain;
+  display: block;
+  flex: 0 0 auto;
+}
+
+.bay-main { min-width: 0; display: block }
+
+.bay-top { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap }
+
+.bay-name {
+  font-weight: 800;
+  font-size: 1.02rem;
+  letter-spacing: -.01em;
+  white-space: nowrap;
+}
+
+/* Telemetry. Monospace and tabular so the numbers do not jitter as they
+   update every eight seconds. */
+.bay-meta,
+.meta {
+  display: block;
+  color: var(--mut);
+  font: .78rem/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+  margin-top: .2rem;
+  word-break: break-word;
+}
+
+.bay-meta code, .meta code { font: inherit; color: var(--fg); font-weight: 600 }
+
+/* Each line of the readout is its own row, and nothing inside a phrase is
+   allowed to break across two of them. */
+.bay-meta .l, .meta .l { display: block }
+.bay-meta .seg, .meta .seg { white-space: nowrap }
+/* The third line is the small print: the limits and the port. */
+.bay-meta .dim, .meta .dim { opacity: .62; font-size: .73rem }
+
+.bay-shot {
+  width: 76px;
+  height: 57px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* How long the server has been up. Quiet by default, because "up 6h" is the
+ * answer almost every time and should not compete with the map and the
+ * players for attention. */
+.bay-life {
+  display: block;
+  margin-top: .2rem;
+  color: var(--mut);
+  font: .73rem var(--sans);
+}
+
+/* Except when systemd had to put it back. That is the one case worth
+ * catching an eye from across the room, because it is the only thing on the
+ * bay that explains why somebody got dropped. */
+.bay-life .relit { color: var(--warn); font-weight: 700 }
+
+/* Capped, not just wrapped — a full server's roster otherwise grows the bay
+ * without bound and drags every shorter bay in the same grid row down with
+ * it (see the align-items note on .bays above). A few rows fit before this
+ * scrolls; the roster is still all there, just not at the cost of the row. */
+.bay-who {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .25rem;
+  margin-top: .3rem;
+  max-height: 6.5rem;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.bay-who span,
+.who span {
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: .16rem .42rem;
+  font: .72rem/1.3 var(--mono);
+}
+
+.bay-who b, .who b { font-weight: 700; font-family: var(--sans) }
+
+/* Whoever is winning. Only marked when there is something to win. */
+.bay-who .lead, .who .lead { border-color: var(--accent); color: var(--fg) }
+.bay-who .lead b, .who .lead b { color: var(--accent) }
+
+/* A bot's own face, beside its name in the player list. */
+.bay-who img, .who img {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  vertical-align: -.25em;
+  margin-right: .3rem;
+  display: inline-block;
+}
+
+/* The level's proper name, where the game knows one. */
+.bay-meta i, .meta i { font-style: normal; color: var(--fg); opacity: .8 }
+.bay-meta i::before, .meta i::before { content: "\2014\00a0" ; opacity: .55 }
+
+/* -------------------------------------------------------------- game pages */
+
+/* The game block IS the card on a game page, so the wrapper around it must
+   not draw a second one. */
+.game-wrap { padding: 0; border: 0; background: none; box-shadow: none }
+
+.game {
+  --accent: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--status, var(--line));
+  border-radius: var(--r);
+  padding: .95rem 1rem;
+  box-shadow: var(--shadow);
+}
+
+/* Picture of the current level, then what it is, then the one destructive
+   control — pinned to the top corner rather than floating beside the status.
+   align-items: start so Restart sits level with the top of the picture instead
+   of drifting to the vertical middle of a 93px block. */
+.ghead {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: .85rem;
+  margin-bottom: .7rem;
+}
+
+.ghead-icon { width: 54px; height: 54px; border-radius: 12px; object-fit: contain; display: block }
+.ghead-text { min-width: 0; padding-top: .1rem }
+.ghead-top { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap }
+.ghead-name { font: 700 1.05rem/1.2 var(--sans) }
+
+/* Restart is the one control here that disconnects everybody, so it sits in
+   the corner: reachable, and never where a thumb lands on the way to the map
+   picker. */
+/* Restart and Stop sit side by side while the server is running, and a
+   single Start replaces both when it is not. docs/adr/0003. */
+.restart { grid-column: 3; align-self: start; display: flex; gap: .35rem }
+.parked { color: var(--mut); font-weight: 700 }
+
+.ghead-shot {
+  width: 124px;
+  height: 93px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  display: block;
+}
+
+/* On a phone the picture keeps its place but gives back some width. */
+@media (max-width: 480px) {
+  .ghead { gap: .6rem }
+  .ghead-shot { width: 92px; height: 69px }
+}
+
+.port {
+  font: 600 .7rem/1 var(--mono);
+  color: var(--mut);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .25rem .4rem;
+}
+
+.who { display: flex; flex-wrap: wrap; gap: .3rem; margin: 0 0 .7rem }
+
+/* A segmented control, because the modes are mutually exclusive and that is
+   what a segmented control means. */
+.modes {
+  display: flex;
+  gap: 2px;
+  margin-bottom: .6rem;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.modes::-webkit-scrollbar { display: none }
+.modes form { display: contents }
+
+.mode {
+  flex: 1 1 auto;
+  min-height: 38px;
+  padding: .45rem .6rem;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--mut);
+  font: 600 .82rem/1 var(--sans);
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.mode[aria-pressed=true] {
+  background: var(--ui);
+  color: var(--ui-fg);
+  border-color: var(--ui);
+  font-weight: 700;
+}
+
+/* --------------------------------------------------------------- controls */
+
+.row { display: flex; gap: .5rem; flex-wrap: wrap }
+.row form { display: flex; gap: .5rem; flex: 1 1 14rem; min-width: 0 }
+/* Next and Random are shortcuts past the dropdown, not the main control. */
+.row form.jump { flex: 0 0 auto }
+.gather-info {
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: .75rem 1rem;
+  font-size: .85rem;
+  line-height: 1.4;
+  color: var(--mut);
+}
+.gather-info b, .gather-info code {
+  color: var(--fg);
+}
+
+/* On a phone the picker was sharing one row with three buttons and ended up
+   showing "dm1 — P…". It gets the row to itself; the buttons go under it. */
+@media (max-width: 34rem) {
+  .row form:first-child { flex: 1 1 100%; flex-wrap: wrap }
+  .row form:first-child .picker { flex: 1 1 100% }
+  .row form:first-child button { flex: 1 1 auto }
+}
+/* On/Off pairs, built like the mode control: the chosen one is filled in.
+   The generic button[aria-pressed=true] rule below is what actually shows the
+   selection — losing it in the redesign left every toggle on every game with
+   no visible state at all, while the attribute was there in the markup the
+   whole time. */
+.pair {
+  display: flex;
+  gap: 2px;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 2px;
+  flex: 0 0 auto;
+}
+
+.pair form { display: contents }
+
+.pair button {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--mut);
+  border-radius: 8px;
+  min-height: 32px;
+  padding: .3rem .8rem;
+}
+
+button[aria-pressed=true] {
+  background: var(--ui);
+  color: var(--ui-fg);
+  border-color: var(--ui);
+  font-weight: 700;
+}
+
+select, input, button {
+  font: 600 15px/1 var(--sans);
+  min-height: 44px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+select, input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 16px;           /* anything smaller and iOS zooms the page */
+  font-weight: 400;
+  padding: .6rem .7rem;
+  background: var(--sunk);
+  color: var(--fg);
+}
+
+select {
+  padding-right: 2rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.6'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right .7rem center;
+}
+
+button {
+  padding: .65rem 1rem;
+  background: var(--panel);
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:active, .mode:active { transform: scale(.985); opacity: .85 }
+
+button.primary {
+  background: var(--ui);
+  color: var(--ui-fg);
+  border-color: var(--ui);
+  width: 100%;
+  max-width: 24rem;      /* a metre of button on a desktop is not more inviting */
+  font-weight: 700;
+  display: block;
+}
+
+/* Already allowed? Then extending is a maintenance action, not the thing you
+   came here to do, and it should not be the loudest object on the page. */
+button.primary.quiet {
+  background: var(--sunk);
+  color: var(--fg);
+  border-color: var(--line);
+  font-weight: 600;
+}
+
+button.primaryish { background: var(--ui); color: var(--ui-fg); border-color: var(--ui) }
+button.danger { color: var(--bad); flex: 0 0 auto }
+button.tiny { min-height: 34px; padding: .3rem .6rem; font-size: .78rem }
+button.copied { color: var(--ok); border-color: var(--ok) }
+
+/* The Web Push opt-in. #5. */
+.hint { color: var(--mut); font-size: .84rem; margin: 0 0 .7rem }
+#notify-btn { width: 100%; max-width: 24rem; }
+#notify-btn.on { background: var(--okbg); color: var(--ok); border-color: var(--ok); font-weight: 700 }
+#notify-btn:disabled { opacity: .6; cursor: default }
+
+.knobs { display: grid; grid-template-columns: 1fr auto; gap: .45rem; align-items: center; margin-top: .4rem }
+.knobs .knob { font-size: .85rem; display: block }
+.knobs form { display: flex; gap: .4rem }
+.knobs input { min-height: 38px; width: 5.5rem; flex: 0 0 auto }
+
+.connect { display: flex; align-items: center; gap: .5rem; margin: .6rem 0 .1rem; flex-wrap: wrap }
+
+.connect code {
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .5rem .65rem;
+  font: 700 .95rem/1 var(--mono);
+  letter-spacing: -.01em;
+}
+
+.sayrow { display: flex; gap: .5rem; margin: .55rem 0 0 }
+.sayrow input { flex: 1 1 auto; min-width: 0 }
+.botrow, .botbar { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; align-items: center }
+.botrow select, .botbar select { flex: 1 1 8rem; min-width: 0 }
+/* "Hurt me plent" — the skill names are long and were being clipped. */
+.botbar select[name=skill] { flex: 1 1 10.5rem }
+.botbar .picker { flex: 1 1 11rem }
+
+/* ------------------------------------------------------------------- tabs */
+
+.tabs {
+  display: flex;
+  gap: .25rem;
+  margin: .8rem 0 .3rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--line);
+}
+
+.tabs::-webkit-scrollbar { display: none }
+
+.tab {
+  flex: 0 0 auto;
+  min-height: 38px;
+  padding: .4rem .75rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--mut);
+  font: 600 .85rem/1 var(--sans);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+
+/* Keyed off the attribute, not a parallel class: the two used to have to be
+   kept in step by hand, and duplicated state drifts. */
+.tab[aria-selected=true] { color: var(--fg); border-bottom-color: var(--ui); font-weight: 700 }
+.tabpanel[data-hide] { display: none }
+
+/* ------------------------------------------------------- pictures of levels */
+
+.shots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+  gap: .5rem;
+  margin-top: .55rem;
+}
+
+.shot {
+  padding: 0;
+  overflow: hidden;
+  min-height: auto;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  display: block;
+  transition: transform .14s ease, box-shadow .14s ease;
+}
+
+@media (hover: hover) {
+  .shot:hover { transform: translateY(-2px); box-shadow: var(--lift) }
+}
+
+.shot img { display: block; width: 100%; height: auto; aspect-ratio: 4/3; object-fit: cover }
+
+.shot span {
+  display: block;
+  padding: .35rem .4rem;
+  font: 600 .72rem/1.2 var(--mono);
+  color: var(--mut);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shot.here { border-color: var(--ui); box-shadow: 0 0 0 2px var(--ui) }
+.shot.here span { color: var(--fg) }
+
+/* ------------------------------------------- the dropdown that holds images */
+
+.picker { position: relative; flex: 1 1 12rem; min-width: 0 }
+
+.picktrigger {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  width: 100%;
+  text-align: left;
+  padding: .35rem .55rem;
+  background: var(--sunk);
+}
+
+.picktrigger img { width: 46px; height: 35px; object-fit: cover; border-radius: 6px; flex: 0 0 auto }
+
+.picktrigger span {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 400 .92rem/1.3 var(--mono);
+}
+
+.picknone { flex: 0 0 auto; width: 0; height: 0 }
+
+.chev {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border: .3rem solid transparent;
+  border-top-color: var(--mut);
+  margin-top: .3rem;
+}
+
+.picklist {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + .3rem);
+  left: 0;
+  right: 0;
+  max-height: 20rem;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r-sm);
+  box-shadow: var(--lift);
+}
+
+.pickitem {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  padding: .35rem .5rem;
+  cursor: pointer;
+  font: 400 .9rem/1.3 var(--mono);
+  border-bottom: 1px solid var(--line);
+}
+
+.pickitem:last-child { border-bottom: 0 }
+.pickitem:hover { background: var(--sunk) }
+.pickitem[aria-selected=true] { background: var(--sunk); box-shadow: inset 3px 0 0 var(--ui) }
+.pickitem img { width: 58px; height: 44px; object-fit: cover; border-radius: 6px; flex: 0 0 auto }
+.pickitem span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+
+/* The bottom row of the bots panel is housekeeping, not the main event. */
+.botrow { border-top: 1px solid var(--line); padding-top: .7rem; margin-top: .7rem }
+
+/* -------------------------------------------------------------- bot faces */
+
+.faces { display: grid; grid-template-columns: repeat(auto-fill, minmax(4.4rem, 1fr)); gap: .4rem }
+
+.face {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .25rem;
+  padding: .4rem .2rem;
+  min-height: auto;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  font: 600 .68rem/1.1 var(--sans);
+  cursor: pointer;
+  transition: transform .12s ease;
+}
+
+.face img { border-radius: 7px; display: block }
+.face span { color: var(--mut); text-align: center; word-break: break-word }
+@media (hover: hover) { .face:hover { transform: translateY(-2px); border-color: var(--ui) } }
+.face:active { transform: scale(.95) }
+
+/* ------------------------------------------------------------ server health
+ *
+ * Four readings and a trace each. The bar gives the number a scale; the trace
+ * gives it a direction. Both are drawn from what this page has watched since
+ * it was opened, which is why the graph fills in rather than arriving whole.
+ */
+
+.gauges {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: .55rem;
+}
+
+.gauge {
+  --level: var(--ok);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: .55rem .6rem .5rem;
+  min-width: 0;
+}
+
+.gauge.warn { --level: var(--warn) }
+.gauge.bad { --level: var(--bad) }
+
+.gauge-top { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem }
+
+.gauge-label {
+  font: 700 .63rem/1 var(--sans);
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  color: var(--mut);
+}
+
+.gauge-value {
+  font: 700 .95rem/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.trace { display: block; width: 100%; height: 26px; margin: .35rem 0 .3rem; overflow: visible }
+.trace-line { fill: none; stroke: var(--level); stroke-width: 1.6; vector-effect: non-scaling-stroke;
+              stroke-linejoin: round; stroke-linecap: round }
+.trace-fill { fill: var(--level); opacity: .13; stroke: none }
+
+.bar { height: 4px; border-radius: 99px; background: var(--line); overflow: hidden; margin-top: .1rem }
+.bar > i { display: block; height: 100%; background: var(--level); border-radius: 99px;
+           transition: width .5s ease }
+
+.gauge-note { color: var(--mut); font-size: .68rem; margin-top: .35rem; line-height: 1.35 }
+
+.services li { padding: .35rem 0; font-size: .82rem }
+.services code { font: .82rem var(--mono) }
+
+@media (prefers-reduced-motion: reduce) { .bar > i { transition: none } }
+
+/* ------------------------------------------------------------- live status */
+
+.live { color: var(--ok); font: 700 .67rem/1 var(--sans); text-transform: uppercase; letter-spacing: .13em }
+
+.live::before {
+  content: "";
+  display: inline-block;
+  width: .45rem;
+  height: .45rem;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: .35rem;
+  vertical-align: .04em;
+  animation: pulse 2.4s infinite;
+}
+
+/* Not live. Amber rather than red: the session running out is expected and
+   recoverable, not a fault. Tappable, because a Home Screen app has no reload
+   button and "reload to sign in" was an instruction with nothing to carry it
+   out. */
+.live.stale {
+  color: var(--warn); letter-spacing: 0; text-transform: none; font-size: .74rem;
+  cursor: pointer; text-decoration: underline; text-underline-offset: 2px;
+}
+.live.stale::before { animation: none }
+
+@keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
+
+@media (prefers-reduced-motion: reduce) {
+  .live::before { animation: none }
+  * { transition: none !important }
+  .bay:hover, .shot:hover, .face:hover { transform: none }
+}
+
+/* ------------------------------------------------------------------- lists */
+
+details { margin-top: .55rem }
+
+summary {
+  cursor: pointer;
+  color: var(--mut);
+  font: 700 .67rem/1 var(--sans);
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  padding: .45rem 0;
+  list-style: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+summary::-webkit-details-marker { display: none }
+summary::before { content: "\25b8\00a0"; display: inline-block; transition: transform .15s }
+details[open] summary::before { transform: rotate(90deg) }
+
+ul.list { list-style: none; margin: 0; padding: 0 }
+
+ul.list li {
+  display: flex;
+  justify-content: space-between;
+  gap: .6rem;
+  align-items: center;
+  padding: .55rem 0;
+  border-top: 1px solid var(--line);
+  font-size: .9rem;
+  flex-wrap: wrap;
+}
+
+ul.list li:first-child { border-top: 0 }
+ul.list code { font: .92rem var(--mono); font-variant-numeric: tabular-nums }
+.grantby { color: var(--mut); font-size: .76rem; flex: 1 1 100%; margin-top: -.2rem }
+.ttl { color: var(--mut); font: .78rem var(--mono); white-space: nowrap }
+
+/* The grant running out is the one number on this page that stops being
+   information and becomes an alarm. Muted grey said the same thing at three
+   hours as at four minutes, and when it hit zero the four bays still read
+   "up", because the servers were up -- it is the route to them that closes.
+   live.js sets these; the thresholds live there and only there. */
+.ttl.warn { color: var(--warn); font-weight: 700 }
+.ttl.danger,
+.ttl.gone { color: var(--bad); font-weight: 700 }
+
+.access-warn {
+  margin: .75rem 0 0;
+  padding: .55rem .7rem;
+  border-radius: .4rem;
+  background: var(--warnbg);
+  color: var(--warn);
+  font: 600 .82rem/1.45 var(--sans);
+}
+/* No empty band on a card that has nothing to warn about. The element is
+   always in the markup so live.js has somewhere to write, and it is only a
+   box when it is holding a sentence. */
+.access-warn:empty { display: none }
+.none { color: var(--bad) }
+.src { color: var(--mut); font-weight: 400; font-size: .72rem; margin-left: .3rem }
+
+.log {
+  font: .76rem/1.55 var(--mono);
+  color: var(--mut);
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Which device you are on. This used to be the address itself, which on a
+ * phone is a full IPv6 and read as a wrong address rather than as yours. The
+ * address moved down to .whoami and a name took its place. Sans, because it
+ * is now words rather than a number. */
+.big {
+  font: 700 1.5rem/1.15 var(--sans);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* The address, demoted. Small enough that a full-length IPv6 could not
+ * overflow the card even before short_addr() elides the middle of it, and
+ * `anywhere` remains the backstop for whatever arrives with no colons. The
+ * whole address is on the title attribute for when it is actually needed. */
+.whoami {
+  color: var(--mut);
+  font: .78rem/1.4 var(--mono);
+  overflow-wrap: anywhere;
+  margin-bottom: .75rem;
+}
+footer { color: var(--mut); font-size: .76rem; text-align: center; margin-top: 1.2rem; line-height: 1.9 }
+footer .live { vertical-align: baseline }
+footer code { font: .76rem var(--mono) }
+
+/* --------------------------------------------------------------- wide-screen
+ *
+ * Two columns of bays and cards rather than a 37rem ribbon down the middle of
+ * a desktop display.
+ */
+
+@media (min-width: 46rem) {
+  /* Wide enough that "map pro-q3dm6 — The Campgrounds II" fits on one line,
+     which three columns did not allow. */
+  .bays { grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr)) }
+}
+
+@media (min-width: 64rem) {
+  main { max-width: 70rem }
+  .stack {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(28rem, 1fr));
+    gap: .8rem;
+    align-items: start;
+  }
+  .stack > .card { margin-bottom: 0 }
+  .stack > .wide { grid-column: 1 / -1 }
+  .knobs { grid-template-columns: 1fr auto auto }
+  h1 { font-size: 1.6rem }
+}
+
+@media (min-width: 100rem) { main { max-width: 84rem } }
+
+@media (max-width: 24rem) {
+  .row form { flex: 1 1 100% }
+  .row button { width: 100% }
+  .bay { grid-template-columns: auto 1fr; gap: .65rem }
+  .bay-shot { display: none }
+  /* One step down at the narrowest width, so a longer device name stays on
+     one line and does not push the button down the card. */
+  .big { font-size: 1.25rem }
+}
+
+/* ------------------------------------------------------------- downloads
+   One row per game: emblem, name, date and size, then the action. Laid out
+   like the server bays so the page keeps one rhythm, but quieter — this is a
+   thing you use occasionally, not something you scan for trouble. */
+.dl-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.dl-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border-radius: 10px;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+}
+.dl-icon { flex: none; border-radius: 6px; }
+.dl-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.dl-name { font-weight: 600; }
+.dl-meta { font-size: 0.82rem; opacity: 0.65; }
+/* The two actions sit in their own group and each has a floor width, so the
+   buttons line up in columns down the card instead of stepping in and out with
+   the length of "24.1 MB" versus "1.6 GB". */
+.dl-actions { flex: none; display: flex; gap: 8px; align-items: center; }
+.dl-get { min-width: 9.5rem; text-align: center; }
+.dl-data { min-width: 11rem; text-align: center; }
+/* Every one of these does the same thing, so every one of them looks the same.
+   They were tinted with each game's colour, which gave four differently
+   coloured buttons for a single action and made the row read as though the
+   colour meant something. Identity is the emblem's job. */
+.dl-get, .dl-data {
+  flex: none; white-space: nowrap;
+  padding: 7px 13px; border-radius: 8px; font-weight: 600; font-size: 0.9rem;
+  text-decoration: none; border: 1px solid var(--line);
+}
+.dl-get { background: var(--ui); color: var(--ui-fg); border-color: var(--ui) }
+/* The data is the second-order action — you fetch it once, then never again —
+   so it is present but quieter than the build it sits beside. */
+.dl-data { background: transparent; color: var(--ui); border-color: var(--edge) }
+.dl-get:hover, .dl-get:focus-visible,
+.dl-data:hover, .dl-data:focus-visible { filter: brightness(1.15); }
+.dl-data:hover, .dl-data:focus-visible { background: var(--ui-soft) }
+.dl-none { flex: none; opacity: 0.5; font-size: 0.9rem; }
+
+/* On a phone the action drops under the name rather than squeezing it. */
+@media (max-width: 560px) {
+  .dl-row { flex-wrap: wrap; }
+  .dl-main { flex-basis: calc(100% - 46px); }
+  .dl-actions { flex-basis: 100%; }
+  .dl-get, .dl-data { flex: 1 1 0; min-width: 0; }
+}
+
+/* ----------------------------------------------------------------- match
+   The game happening right now, as a frag race. Only drawn when somebody is
+   in there — a column of zero-length bars says less than no chart at all.
+   Nothing is stored: it is recomputed from the engine's own status reply
+   every time, which is the only thing that was ever true. */
+.match { margin: .8rem 0 .2rem }
+.match-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  font: 700 .68rem/1 var(--sans); letter-spacing: .09em; text-transform: uppercase;
+  color: var(--mut); margin: 0 0 .55rem;
+}
+.match-note { font-weight: 600; letter-spacing: .04em; text-transform: none; font-size: .74rem }
+.match-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .38rem }
+
+.match-row {
+  display: grid;
+  grid-template-columns: minmax(5.5rem, 8.5rem) 1fr auto auto;
+  align-items: center;
+  gap: .55rem;
+}
+.match-who { display: flex; align-items: center; gap: .35rem; min-width: 0 }
+.match-face { border-radius: 5px; flex: none; display: block }
+.match-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 600 .84rem/1.2 var(--sans);
+}
+.match-row.lead .match-name { color: var(--fg) }
+
+/* The bar is scaled to the fraglimit where one is set, so its length means
+   "how close is this to being over" rather than only "who is ahead". */
+.match-track {
+  height: 9px; border-radius: 99px; background: var(--sunk);
+  border: 1px solid var(--line); overflow: hidden; min-width: 2rem;
+}
+.match-fill {
+  display: block; height: 100%;
+  background: var(--mut); border-radius: 99px;
+  transition: width .5s cubic-bezier(.22, 1, .36, 1);
+}
+.match-row.lead .match-fill { background: var(--ui) }
+
+.match-score { font: 700 .86rem/1 var(--mono); min-width: 1.8rem; text-align: right }
+.match-ping { font: 600 .7rem/1 var(--mono); min-width: 3.1rem; text-align: right }
+/* Ping is a genuine RAG: it is the one number here that says whether the game
+   is playable rather than who is winning. */
+.match-ping.up { color: var(--ok) }
+.match-ping.warn { color: var(--warn) }
+.match-ping.down { color: var(--bad) }
+.match-ping.mut { color: var(--mut) }
+
+.match-prog {
+  height: 4px; border-radius: 99px; background: var(--sunk);
+  border: 1px solid var(--line); overflow: hidden; margin-top: .6rem;
+}
+.match-prog span {
+  display: block; height: 100%; background: var(--ui); border-radius: 99px;
+  transition: width .5s cubic-bezier(.22, 1, .36, 1);
+}
+.match-foot { font: .72rem/1 var(--mono); color: var(--mut); margin: .4rem 0 0 }
+
+@media (max-width: 480px) {
+  .match-row { grid-template-columns: minmax(4.5rem, 6.5rem) 1fr auto auto; gap: .4rem }
+  .match-ping { min-width: 2.6rem }
+}
+
+/* Team scores, for Team DM and CTF. Red and blue here are not decoration and
+   not a status: they are the teams, which is what the data actually is. */
+.team-list { list-style: none; margin: 0 0 .5rem; padding: 0; display: grid; gap: .35rem }
+.team-row {
+  display: grid; grid-template-columns: minmax(5.5rem, 8.5rem) 1fr auto;
+  align-items: center; gap: .55rem;
+}
+.team-name { font: 700 .84rem/1.2 var(--sans) }
+.team-row.red .team-name { color: var(--team-red) }
+.team-row.blue .team-name { color: var(--team-blue) }
+.team-fill { display: block; height: 100%; border-radius: 99px; transition: width .5s cubic-bezier(.22,1,.36,1) }
+.team-row.red .team-fill { background: var(--team-red) }
+.team-row.blue .team-fill { background: var(--team-blue) }
+.team-row .match-track { height: 12px }
+
+/* ------------------------------------------------------- pull to refresh
+   Only ever built in standalone mode. In a normal tab the browser has its own
+   pull-to-refresh and its own reload button, and a second one fights it. */
+.ptr {
+  position: fixed;
+  top: calc(-44px + env(safe-area-inset-top));
+  left: 0; right: 0;
+  height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+  z-index: 50;
+}
+.ptr-spin {
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: var(--ui);
+  opacity: .55;
+  transition: opacity .15s ease, transform .15s ease;
+}
+.ptr-live .ptr-spin { opacity: .85 }
+/* Armed: let go now and it reloads. It has to be obvious before you commit,
+   or the gesture is a guess. */
+.ptr-armed .ptr-spin {
+  opacity: 1;
+  transform: scale(1.15) rotate(180deg);
+  border-top-color: var(--ok);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ptr-spin { transition: none }
+}
+
+/* In a team game the individual list is not the standing, and says so. */
+.match-sub {
+  font: .72rem/1.3 var(--sans); color: var(--mut);
+  margin: .1rem 0 .45rem;
+}
+
+/* Which side a player is on. A dot rather than coloured text: the name has to
+   stay legible, and four red names next to four blue ones is a lot of colour
+   for a list you read top to bottom. */
+.match-row.side-red .match-name::before,
+.match-row.side-blue .match-name::before {
+  content: "";
+  display: inline-block;
+  width: .5rem; height: .5rem;
+  border-radius: 50%;
+  margin-right: .4rem;
+  vertical-align: baseline;
+}
+.match-row.side-red .match-name::before { background: var(--team-red) }
+.match-row.side-blue .match-name::before { background: var(--team-blue) }
+.match-row.side-red .match-fill { background: var(--team-red) }
+.match-row.side-blue .match-fill { background: var(--team-blue) }
+/* The leader's bar is the team colour too, not the interactive blue, or the
+   leader on the red team gets a blue bar. */
+.match-row.lead.side-red .match-fill { background: var(--team-red) }
+.match-row.lead.side-blue .match-fill { background: var(--team-blue) }
+
+/* ------------------------------------------------------------- settings
+   One row per setting: what it is on the left, the control on the right, a
+   hairline between. It was a two-column grid with a .45rem gap, which packed
+   four unrelated controls into a block you had to read carefully to use. */
+.knobs { display: block; margin-top: .2rem }
+.knob-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; padding: .6rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.knob-row:last-child { border-bottom: 0 }
+.knobs .knob { font-size: .9rem; font-weight: 600; display: block }
+.knobs form { display: flex; gap: .4rem; flex: 0 0 auto }
+.knobs input { min-height: 38px; width: 5.5rem; flex: 0 0 auto }
+
+/* A bitfield is a lot of switches, so it gets the full width and wraps. */
+.knob-wide { flex-direction: column; align-items: stretch; gap: .5rem }
+.chips { display: flex; flex-wrap: wrap; gap: .4rem }
+.chips .bit { display: contents }
+.chip {
+  min-height: 34px; padding: .3rem .7rem;
+  border-radius: 99px; border: 1px solid var(--line);
+  background: transparent; color: var(--mut);
+  font: 600 .8rem/1 var(--sans); cursor: pointer;
+  -webkit-appearance: none; touch-action: manipulation;
+}
+.chip[aria-pressed=true] {
+  background: var(--ui); color: var(--ui-fg); border-color: var(--ui);
+}
+.chip:active { transform: scale(.985); opacity: .85 }
+
+@media (max-width: 480px) {
+  .knob-row { flex-direction: column; align-items: stretch; gap: .45rem }
+  .knobs form { justify-content: flex-end }
+}
+
+/* Standalone on iOS has no address bar to pull against, so the page itself
+   rubber-bands and fights the pull-to-refresh gesture. Containing the
+   overscroll keeps the two from arguing. */
+body { overscroll-behavior-y: contain }
+
+/* Which server build is installed (#6). Muted and small: it is a detail you
+   go looking for, not something to compete with the state pill. It wraps
+   rather than truncating -- a build id cut off mid-hash is worse than one on
+   two lines, which is the lesson from the clipped IPv6 in #3. */
+.build {
+  margin: .5rem 0 0;
+  color: var(--mut);
+  font: .72rem/1.5 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* ADR 0001: this repo cannot attest that a binary came from the source it
+   names, and Quake III's current release says so itself. Showing it is not
+   gating on it -- but it should not be invisible either. */
+.build-dirty { color: var(--warn) }

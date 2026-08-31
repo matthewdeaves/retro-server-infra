@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+#
+# time-poll — measure what /api/status costs the box, and whether the four
+# `systemctl show` calls added for #2 are worth folding into one.
+#
+#   bin/time-poll             measure on the box (the only real answer)
+#   bin/time-poll --selftest  run the same arithmetic against /usr/bin/true,
+#                             locally. NOT the answer. Proves the harness runs.
+#
+# Why this is a file and not a comment on the ticket. It was a comment on
+# retro-server-infra#2 first, and someone then had to correct its baseline in a
+# second comment. A harness that lives in a comment cannot be diffed when that
+# happens, cannot be run without copy-pasting out of a browser, and is one
+# deleted comment from gone.
+#
+# THE BASELINE IS THE POINT. The first version of this timed the addition
+# against 4x `systemctl is-active` and called that "the existing poll". It is
+# not. One /api/status does all of this (admin/retro-admin.py:3509):
+#
+#   4x systemctl is-active           unit_state, :1476
+#   4x sudo nft -j list set          players, players6, admins, admins_dyn,
+#                                    via set_members :1678
+#   1x journalctl -u retro-admin     -n 400, activity_lines -> audit_tail :1769
+#   1x vnstat --json m               uncached every time, :1558
+#   up to 4 UDP round trips          live_state ttl is 2.0s and the poll is 8s,
+#                                    so always cold, :1347
+#
+# The journalctl and the vnstat are each heavier than a `systemctl show`.
+# Timing against is-active alone makes the addition look several times larger
+# than it is, which is an argument for optimising something that does not need
+# it.
+#
+# The UDP round trips are NOT measured here: that needs each engine's status
+# protocol and the servers answering. Leaving them out understates the
+# baseline, so the percentage this prints is HIGHER than the truth. That is the
+# safe direction — it can only make you fold the calls when you did not have
+# to, never leave them when you should have folded.
+#
+# WHAT IS BEING MEASURED. unit_health (:1622) has no cache and runs one
+# `systemctl show` per call. /api/status reaches it twice per game: through
+# life_html in the games loop, and through restart_lines (:1737), which walks
+# all four units unconditionally. 4 + 4 = 8 per poll. A page render reaches it
+# four times.
+#
+# AND THE MULTIPLIER. Server is ThreadingMixIn (:3904) and every open page
+# polls on its own timer. Two people with a phone and a desktop is 2-3 pages,
+# so 16-24 calls per 8 seconds rather than 8. The verdict below is judged at
+# PAGES_JUDGED open pages, not one.
+#
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[ -f "$REPO_ROOT/.env" ] && set -a && . "$REPO_ROOT/.env" && set +a
+
+: "${RETRO_SERVER_IP:?RETRO_SERVER_IP not set — copy .env.example to .env and fill it in}"
+: "${RETRO_SSH_USER:=ubuntu}"
+: "${RETRO_SSH_KEY:=$HOME/.ssh/id_ed25519}"
+
+SSH_KEY="${RETRO_SSH_KEY/#\~/$HOME}"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$SSH_KEY" "$RETRO_SSH_USER@$RETRO_SERVER_IP")
+
+# ------------------------------------------------------------- the thresholds
+#
+# Written down before the measurement, deliberately, so the number cannot be
+# read generously after the fact. These are the constants the verdict uses;
+# they are not prose and must not drift back into prose.
+#
+POLL_MS=8000        # live.js:131, setInterval(poll, 8000)
+SETTLED_PCT=1.0     # at or under this, it is settled and needs no more thought
+FOLD_PCT=5.0        # over this, fold the 8 calls into one systemctl show
+PAGES_JUDGED=3      # phone + desktop + one spare; the expected worst case
+ITERS=20            # iterations per timed group
+
+# The program that does the timing. Runs on the box under `python3 -`, so
+# nothing has to be installed there and nothing is left behind.
+harness() {
+  cat <<PY
+import subprocess, time
+
+POLL_MS      = $POLL_MS
+SETTLED_PCT  = $SETTLED_PCT
+FOLD_PCT     = $FOLD_PCT
+PAGES_JUDGED = $PAGES_JUDGED
+ITERS        = $ITERS
+SELFTEST     = $1
+
+UNITS = ["quakespasm-server", "q2ded", "ioq3ded", "xash-server"]
+SETS  = ["players", "players6", "admins", "admins_dyn"]
+
+def run(cmd):
+    subprocess.run(cmd, capture_output=True)
+
+if SELFTEST:
+    # Every call becomes /usr/bin/true. The SHAPE of the poll is preserved --
+    # same number of processes -- but none of them do any work, so the numbers
+    # are meaningless as an answer and are labelled as such below.
+    T = ["/usr/bin/true"]
+    is_active  = lambda u: run(T)
+    nft_set    = lambda s: run(T)
+    journal    = lambda:   run(T)
+    vnstat     = lambda:   run(T)
+    show       = lambda u: run(T)
+else:
+    is_active  = lambda u: run(["systemctl", "is-active", u])
+    nft_set    = lambda s: run(["sudo", "nft", "-j", "list", "set", "inet", "filter", s])
+    journal    = lambda:   run(["journalctl", "-u", "retro-admin", "-n", "400",
+                                "--no-pager", "-o", "cat"])
+    vnstat     = lambda:   run(["vnstat", "--json", "m"])
+    show       = lambda u: run(["systemctl", "show", u, "-p", "NRestarts",
+                                "-p", "ActiveEnterTimestamp"])
+
+def timed(fn, n=ITERS):
+    # A warm-up pass that is not counted. The first journalctl of a run pays
+    # for opening the journal, and charging that to the average makes the
+    # baseline look worse than it is on every poll after the first.
+    fn()
+    s = time.perf_counter()
+    for _ in range(n):
+        fn()
+    return (time.perf_counter() - s) / n * 1000.0
+
+def baseline():
+    for u in UNITS:
+        is_active(u)
+    for s in SETS:
+        nft_set(s)
+    journal()
+    vnstat()
+
+def added():
+    # 8 per poll: 4 through life_html, 4 through restart_lines.
+    for u in UNITS:
+        show(u)
+    for u in UNITS:
+        show(u)
+
+base = timed(baseline)
+add  = timed(added)
+
+print("")
+if SELFTEST:
+    print("  *** SELFTEST: THIS IS NOT THE ANSWER ***")
+    print("  Every call above was /usr/bin/true, not systemctl, nft, journalctl")
+    print("  or vnstat. It proves the harness runs and the arithmetic is right.")
+    print("  It proves NOTHING about the box. Run without --selftest for that.")
+    print("")
+
+print("  per /api/status poll, mean of %d, warm-up discarded" % ITERS)
+print("")
+print("    existing  4x is-active + 4x nft + journalctl -n 400 + vnstat")
+print("                                          %8.1f ms" % base)
+print("    added     8x systemctl show           %8.1f ms" % add)
+print("")
+print("  UDP status queries are not in the baseline, so the real poll is")
+print("  heavier than shown and these percentages are upper bounds.")
+print("")
+
+for pages in range(1, PAGES_JUDGED + 1):
+    pct = (add * pages) / POLL_MS * 100.0
+    mark = "  <- judged here" if pages == PAGES_JUDGED else ""
+    print("    %d page(s) open: added is %5.2f%% of the %d ms poll%s"
+          % (pages, pct, POLL_MS, mark))
+
+pct = (add * PAGES_JUDGED) / POLL_MS * 100.0
+print("")
+if pct <= SETTLED_PCT:
+    print("  VERDICT settled. %.2f%% at %d pages is at or under the %.1f%%"
+          % (pct, PAGES_JUDGED, SETTLED_PCT))
+    print("  threshold. Leave the eight calls alone.")
+elif pct > FOLD_PCT:
+    print("  VERDICT fold them. %.2f%% at %d pages is over the %.1f%% threshold."
+          % (pct, PAGES_JUDGED, FOLD_PCT))
+    print("  Fetch NRestarts and ActiveEnterTimestamp for all four units in one")
+    print("  systemctl show instead of eight. The output format supports it.")
+else:
+    print("  VERDICT judgement call. %.2f%% at %d pages is between the %.1f%%"
+          % (pct, PAGES_JUDGED, SETTLED_PCT))
+    print("  settled threshold and the %.1f%% fold threshold. Neither number" % FOLD_PCT)
+    print("  decides it; say which way you went on #2 and why.")
+print("")
+PY
+}
+
+if [ "${1:-}" = "--selftest" ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "time-poll: no python3 here" >&2; exit 1; }
+  [ -x /usr/bin/true ] || { echo "time-poll: no /usr/bin/true to time against" >&2; exit 1; }
+  harness True | python3 -
+  exit 0
+fi
+
+if [ "${1:-}" != "" ]; then
+  echo "time-poll: unknown argument '$1' (try --selftest, or no argument)" >&2
+  exit 2
+fi
+
+# REFUSE RATHER THAN INVENT. A harness that cannot reach the box must say so
+# and stop. The failure this repo keeps hitting is a check that produces a
+# clean-looking number having measured nothing at all, and a timing harness
+# that silently fell back to the laptop would be exactly that: the laptop is an
+# Apple Silicon machine and the box is one aarch64 OCPU, so the numbers would
+# be wrong in the flattering direction.
+if ! "${SSH[@]}" true 2>/dev/null; then
+  cat >&2 <<EOF
+time-poll: cannot reach $RETRO_SSH_USER@$RETRO_SERVER_IP over SSH, so there is
+           no measurement to report. NOT falling back to this machine: it is
+           not the box, and a number from it would be wrong in the direction
+           that makes the addition look free.
+
+           Usually this is the 12h nftables grant having expired rather than
+           anything being wrong with the box. Check the instance is up first:
+
+             oci compute instance list --compartment-id \$RETRO_TENANCY_OCID
+
+           If it is running, open the admin UI and press "Let me in", which
+           re-adds this address to players and admins_dyn.
+
+           bin/time-poll --selftest runs the arithmetic locally, but it times
+           /usr/bin/true and is NOT an answer about the box.
+EOF
+  exit 1
+fi
+
+echo "measuring on $RETRO_SERVER_IP as $RETRO_SSH_USER"
+harness False | "${SSH[@]}" "python3 -"

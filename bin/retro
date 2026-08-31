@@ -1,0 +1,1053 @@
+#!/usr/bin/env bash
+#
+# retro — control the four retro game servers.
+#
+# Everything runs over SSH. There is no rcon anywhere in this script and there
+# should never be: each systemd unit opens a console FIFO on fd 3 and holds it
+# read-write so it never sees EOF, which means a plain `echo` into the FIFO is
+# a server console command. That is strictly better than rcon, whose password
+# crosses the network in the clear.
+#
+#   retro status                     what is running
+#   retro map quake3 q3dm17          change map, keeping players connected
+#   retro console quake2 "status"    raw console command
+#   retro restart halflife           restart the binary (drops players)
+#   retro logs quake                 follow the console
+#   retro allow [ip]                 open the game ports to an address, with a TTL
+#   retro allowlist                  who can currently reach the games
+#   retro deploy [game|all]          install server binaries from GitHub releases
+#   retro admin                      deploy the web admin UI to the box
+#   retro selftest                   render every admin page and check every image
+#   retro verify [game] [--force]    prove the controls work (DISTURBS the servers)
+#   retro dropins                    install the local systemd overrides
+#   retro drift                      does the box still match this checkout?
+#   retro content <game>             upload game content from ~/srv-build
+#   retro gamedata                   push game-data/*.zip to the box and verify
+#   retro ssh                        shell on the box
+#   retro box stop | box start       power the Oracle instance off/on
+#   retro dns-sync                   point the DNS records at the live IP
+#
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[ -f "$REPO_ROOT/.env" ] && set -a && . "$REPO_ROOT/.env" && set +a
+
+: "${RETRO_SERVER_IP:?RETRO_SERVER_IP not set — copy .env.example to .env and fill it in}"
+: "${RETRO_SSH_USER:=ubuntu}"
+: "${RETRO_SSH_KEY:=$HOME/.ssh/id_ed25519}"
+: "${RETRO_ALLOW_TTL:=12h}"
+
+SSH_KEY="${RETRO_SSH_KEY/#\~/$HOME}"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$SSH_KEY" "$RETRO_SSH_USER@$RETRO_SERVER_IP")
+
+# ---------------------------------------------------------------- game table
+#
+# unit name | console FIFO | install dir | gamedir | map command | release repo
+#
+# Two traps encoded here. First, the unit name and the runtime directory do NOT
+# match for Quake II and Half-Life — q2ded.service declares
+# RuntimeDirectory=quake2-server. Second, and this is the one that matters at a
+# party: `map` and `changelevel` are not synonyms.
+#
+#   Quake      Host_Changelevel_f is commented "Goes to a new map, taking all
+#              clients along". Host_Map_f calls CL_Disconnect() first and drops
+#              everyone. (Quake/host_cmd.c:921 vs :850)
+#   Half-Life  same inheritance, same rule.
+#   Quake III  `map` is safe: SV_SpawnServer re-runs GAME_CLIENT_CONNECT with
+#              firstTime=qfalse and keeps clients. (code/server/sv_init.c:535)
+#   Quake II   `gamemap` broadcasts reconnect; players follow, but visibly.
+#              (src/server/sv_init.c:508)
+game_row() {
+  case "$1" in
+    quake|q1)       echo "quakespasm-server /run/quakespasm-server/console /opt/quakespasm-server id1    changelevel old-mac-quakespasm   server-v1.18   quakespasm-server-v1.18  quakespasm-server" ;;
+    quake2|q2)      echo "q2ded              /run/quake2-server/console     /opt/quake2-server     baseq2 gamemap     old-mac-quake2       server-v3.0.1  quake2-server-v3.0.1     q2ded" ;;
+    quake3|q3)      echo "ioq3ded            /run/quake3-server/console     /opt/quake3-server     baseq3 map         old-mac-quake3       server-v0.6.7  quake3-server-v0.6.7     ioq3ded" ;;
+    halflife|hl)    echo "xash-server        /run/half-life-server/console  /opt/half-life-server  valve  changelevel old-mac-half-life-1  server-v1.10.3 half-life-server-v1.10.3 xash" ;;
+    alephone|ao)    echo "alephone-server    /run/alephone-server/console   /opt/alephone-server   Scenarios changelevel alephone          server-v1.0.0  alephone-server-v1.0.0   alephone-server" ;;
+    *) echo "unknown game: $1 (quake|quake2|quake3|halflife|alephone)" >&2; return 1 ;;
+  esac
+}
+
+ALL_GAMES="quake quake2 quake3 halflife alephone"
+
+field() { game_row "$1" | awk -v n="$2" '{print $n}'; }
+unit()    { field "$1" 1; }
+fifo()    { field "$1" 2; }
+dir()     { field "$1" 3; }
+gamedir() { field "$1" 4; }
+mapcmd()  { field "$1" 5; }
+ghrepo()  { field "$1" 6; }
+ghtag()   { field "$1" 7; }
+tarstem() { field "$1" 8; }
+# The unit name is NOT the binary name for Half-Life: xash-server.service runs
+# a binary called plain `xash`. Column 9 exists so the deploy can check that a
+# staged tarball actually contains the thing it is meant to install.
+binary()  { field "$1" 9; }
+
+# Content on this Mac. Not in the repo and never will be — the game repos ship
+# code, not content, and that rule does not stop at their boundary.
+content_src() {
+  case "$1" in
+    quake|q1)    echo "$HOME/srv-build/deploy/q1/id1" ;;
+    quake2|q2)   echo "$HOME/srv-build/deploy/q2/baseq2" ;;
+    quake3|q3)   echo "$HOME/srv-build/smoke/q3root/baseq3" ;;
+    halflife|hl) echo "$HOME/srv-build/smoke/hlroot/valve" ;;
+    alephone|ao) echo "$HOME/srv-build/smoke/alephone" ;;
+  esac
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Some dropins carry an @@RETRO_SERVER_IP@@ placeholder for a value that is
+# genuinely per-instance (see dropins/quakespasm-server.service.d/override.conf)
+# rather than a real address baked into the tracked file. Substituted here so
+# both drift-checking and pushing compare/ship the same rendered content.
+_render_dropin() {
+  local tmp; tmp=$(mktemp)
+  sed "s/@@RETRO_SERVER_IP@@/$RETRO_SERVER_IP/g" "$1" > "$tmp"
+  echo "$tmp"
+}
+
+# ------------------------------------------------------------------ commands
+
+# ---------------------------------------------------------- engine liveness
+#
+# `systemctl is-active` is not a liveness check for a game server. On
+# 2026-08-22 Quake II answered nothing for six minutes while every layer above
+# reported health: the game called ShutdownGame after failing to load a map,
+# but the PROCESS stayed up holding UDP 27910, so systemd said "active",
+# Restart=on-failure never fired, and `retro status` printed a tidy table of
+# four healthy servers. The only thing that knew was the player who could not
+# connect.
+#
+# So ask the engines. Each one answers a connectionless query with its own
+# name for the map it is running, and a server that cannot answer that is not
+# a server whatever systemd thinks. Probed from the box over loopback, so the
+# firewall allowlist is not in the path — this is asking "is the game alive",
+# not "can I reach it from here".
+engine_probe() {
+  # Delimiter quoted. Unquoted, the shell strips one level of backslash on the
+  # way through and Python receives \mapname\ as \m — an invalid escape, and
+  # the probe dies with a regex error rather than an answer.
+  "${SSH[@]}" 'python3 - <<"PY" 2>/dev/null
+import socket, re
+GAMES = [
+    ("quake",    26000, b"\x80\x00\x00\x0c\x02QUAKE\x00\x03"),
+    ("quake2",   27910, b"\xff\xff\xff\xffstatus\n"),
+    ("quake3",   27960, b"\xff\xff\xff\xffgetstatus\n"),
+    ("halflife", 27015, b"\xff\xff\xff\xffTSource Engine Query\x00"),
+    ("alephone", 4226,  b""),
+]
+for name, port, pkt in GAMES:
+    if not pkt:
+        # alephone (StandaloneHub) has no protocol-level status query and no
+        # admin console (issue #16) -- a bare connect-and-close only proves
+        # the socket accepts connections, not that anyone is using it. The
+        # closest real signal available from the box itself: how many TCP
+        # connections are actually established on its port right now, since
+        # a session needs one client connected as gatherer before there is
+        # anything to join (README.txt on the box, confirmed empirically
+        # 2026-08-30 -- zero ESTAB connections the entire time nobody had
+        # ever gathered a game). "0" here does not mean broken, same as it
+        # never has -- it means idle, which used to be reported as "-" with
+        # no way to tell it apart from "someone is mid-game".
+        # Counted BEFORE the connect below, deliberately -- doing it after
+        # once counted this very probe connection as though it were a real
+        # one, reporting "1conn" with nobody actually there (caught testing
+        # this fix live, 2026-08-30, cross-checked against ss showing zero).
+        estab = 0
+        try:
+            with open("/proc/net/tcp") as f:
+                next(f)  # header
+                port_hex = "%04X" % port
+                for line in f:
+                    cols = line.split()
+                    local, state = cols[1], cols[3]
+                    if local.split(":")[1] == port_hex and state == "01":
+                        estab += 1
+        except OSError:
+            estab = None
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        try:
+            s.connect(("127.0.0.1", port))
+            # Single token -- the awk in cmd_status only takes field 4 for
+            # this column, same as the map name every other game reports
+            # here.
+            detail = "?" if estab is None else ("%dconn" % estab if estab else "-")
+            print("PROBE %s up %s" % (name, detail))
+        except OSError:
+            print("PROBE %s down -" % name)
+        finally:
+            s.close()
+        continue
+    reply = b""
+    # Two attempts: a single dropped datagram is not a dead server, and UDP
+    # loses one now and then even on loopback.
+    for _ in range(2):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(3)
+        try:
+            s.sendto(pkt, ("127.0.0.1", port))
+            reply, _a = s.recvfrom(8192)
+            break
+        except OSError:
+            pass
+        finally:
+            s.close()
+    if not reply:
+        print("PROBE %s down -" % name)
+        continue
+    text = reply.decode("latin-1", "replace")
+    m = re.search(r"\\mapname\\([^\\\n]*)", text)
+    mapname = m.group(1) if m else ""
+    if not mapname:
+        # Quake and Half-Life do not use the \\key\\value form. Their replies
+        # carry NUL-separated strings; the map is one of them, and for the
+        # purposes of this check any non-empty answer proves the engine is
+        # alive. Reported as "?" rather than guessed wrong.
+        mapname = "?"
+    print("PROBE %s up %s" % (name, mapname))
+PY'
+}
+
+cmd_status() {
+  echo "server   $RETRO_SERVER_IP"
+  "${SSH[@]}" 'uptime | sed "s/^/uptime  /"; echo'
+  local probe; probe=$(engine_probe | grep "^PROBE " || true)
+  printf "%-10s %-16s %-8s %-6s %-9s %s\n" GAME UNIT STATE PORT ENGINE MAP
+  local ports="quake:26000 quake2:27910 quake3:27960 halflife:27015 alephone:4226"
+  for g in $ALL_GAMES; do
+    local u state port line eng mapname
+    u=$(unit "$g")
+    state=$("${SSH[@]}" "systemctl is-active $u 2>/dev/null || true")
+    port=$(echo "$ports" | tr ' ' '\n' | grep "^$g:" | cut -d: -f2)
+    line=$(printf "%s\n" "$probe" | awk -v g="$g" '$2==g {print; exit}')
+    eng=$(printf "%s" "$line" | awk '{print $3}')
+    mapname=$(printf "%s" "$line" | awk '{print $4}')
+    case "$eng" in
+      up)   eng="answering" ;;
+      down) eng="SILENT" ;;
+      *)    eng="unknown" ;;
+    esac
+    printf "%-10s %-16s %-8s %-6s %-9s %s\n" "$g" "$u" "${state:-absent}" "$port" "$eng" "${mapname:--}"
+  done
+  echo
+  cmd_allowlist
+}
+
+# The gate version: a unit that systemd calls active while the engine answers
+# nothing is the failure this exists for, so that combination is fatal.
+engine_canary() {
+  local probe rc=0
+  probe=$(engine_probe | grep "^PROBE " || true)
+  if [ -z "$probe" ]; then
+    printf "  %-40s %s\n" "engines answering" "UNKNOWN"
+    echo "    could not probe the engines, so their liveness is unproven. Treating" >&2
+    echo "    that as a failure: a game server that cannot be asked is not one that" >&2
+    echo "    has been shown to work." >&2
+    return 1
+  fi
+  local silent=""
+  for g in $ALL_GAMES; do
+    local u state eng
+    u=$(unit "$g")
+    eng=$(printf "%s\n" "$probe" | awk -v g="$g" '$2==g {print $3; exit}')
+    state=$("${SSH[@]}" "systemctl is-active $u 2>/dev/null || true")
+    if [ "$eng" != "up" ] && [ "$state" = "active" ]; then
+      silent="$silent $g"
+      rc=1
+    fi
+  done
+  if [ "$rc" -eq 0 ]; then
+    printf "  %-40s %s\n" "engines answering" "all four"
+    return 0
+  fi
+  printf "  %-40s %s\n" "engines answering" "SILENT:$silent"
+  echo "    systemd calls the unit(s)$silent active, but the engine answers no status" >&2
+  echo "    query. The process is up and holding the port while the game inside it is" >&2
+  echo "    gone, so Restart=on-failure will never fire and nothing else will notice." >&2
+  echo "    Restart it: retro restart$silent — then find out what killed the game," >&2
+  echo "    because the unit staying 'active' means the journal is the only record." >&2
+  return 1
+}
+
+cmd_console() {
+  local g="$1"; shift
+  [ $# -gt 0 ] || die "usage: retro console <game> <command...>"
+  local f; f=$(fifo "$g")
+  # The FIFO is mode 0600 and owned by the game user, so this needs sudo.
+  "${SSH[@]}" "printf '%s\n' $(printf '%q' "$*") | sudo tee $f >/dev/null"
+  echo "sent to $g: $*"
+}
+
+cmd_map() {
+  local g="$1" m="${2:-}"
+  [ -n "$m" ] || die "usage: retro map <game> <mapname>"
+  local mc; mc=$(mapcmd "$g")
+  case "$mc" in
+    changelevel) echo "using 'changelevel' — players stay connected" ;;
+    gamemap)     echo "using 'gamemap' — players follow, with a visible reconnect" ;;
+    map)         echo "using 'map' — Quake III carries clients through this" ;;
+  esac
+  cmd_console "$g" "$mc $m"
+}
+
+cmd_restart() { local u; u=$(unit "$1"); echo "restarting $u — THIS DROPS ALL PLAYERS"; "${SSH[@]}" "sudo systemctl restart $u"; "${SSH[@]}" "systemctl is-active $u"; }
+cmd_start()   { local u; u=$(unit "$1"); "${SSH[@]}" "sudo systemctl start $u"; "${SSH[@]}" "systemctl is-active $u"; }
+cmd_stop()    { local u; u=$(unit "$1"); "${SSH[@]}" "sudo systemctl stop $u"; echo "stopped $u"; }
+cmd_logs()    { local u; u=$(unit "$1"); "${SSH[@]}" -t "sudo journalctl -u $u -n 60 -f"; }
+
+# The allowlist is the whole security model for the game ports. Three of the
+# four engines answer unauthenticated status queries with far more than they
+# were asked for and have no rate limit of their own — Half-Life measures 101x.
+# An open port here is a usable DDoS reflector firing under Oracle's addresses.
+cmd_allow() {
+  local ip="${1:-}"
+  if [ -z "$ip" ]; then
+    ip=$(curl -s --max-time 10 https://api.ipify.org) || die "could not determine your public IP"
+    echo "your address: $ip"
+  fi
+  # Delete before add: `nft add element` on an element that already exists is
+  # a no-op that still exits 0 (confirmed live, nftables v1.0.9) -- re-running
+  # this against an already-granted address left its real kernel timeout
+  # unchanged. Same bug, same fix, as the web UI's post_allow.
+  "${SSH[@]}" "sudo nft delete element inet filter players { $ip } 2>/dev/null; sudo nft add element inet filter players { $ip timeout $RETRO_ALLOW_TTL }"
+  echo "$ip may now reach the game ports for $RETRO_ALLOW_TTL"
+}
+
+cmd_revoke() { local ip="${1:?usage: retro revoke <ip>}"; "${SSH[@]}" "sudo nft delete element inet filter players { $ip }"; echo "$ip revoked"; }
+
+cmd_allowlist() {
+  echo "players allowed to reach the game ports:"
+  # In nftables JSON `timeout` is the TTL the element was created with and
+  # `expires` is what is LEFT of it. This printed `timeout - expires`, which is
+  # the time ELAPSED, under a label that said "expires in" — so the number
+  # counted up as the grant aged and only equalled the truth at the moment the
+  # grant ran out. It read "expires in 1510s" for an address that still had
+  # 11h34m of access. Wrong in the direction that matters: it makes a grant with
+  # most of a day left look like one that is nearly over.
+  "${SSH[@]}" "sudo nft -j list set inet filter players 2>/dev/null" \
+    | jq -r '.nftables[]?.set?.elem[]? | if type=="object" then
+               (.elem.expires // 0) as $s |
+               "  \(.elem.val)  \($s / 3600 | floor)h\($s % 3600 / 60 | floor)m left of \(.elem.timeout // 0 | . / 3600)h"
+             else "  \(.)" end' 2>/dev/null \
+    || echo "  (none — nobody can connect)"
+}
+
+# Deploy in three phases: resolve everything, stage everything, then swap.
+#
+# It used to do one game at a time and, within a game, stop the unit BEFORE it
+# looked the release up. Two ways that turns a bad build into downtime:
+#
+#   A pin that no longer resolves. `server-v1.10.0` was deleted from
+#   old-mac-half-life-1 and sat in the table above pointing at nothing. The old
+#   order stopped Half-Life, then found no asset, then died — server down,
+#   nothing installed, no restart.
+#
+#   A truncated download. Measured on the box: cutting the 517218-byte Quake III
+#   tarball to 400000 makes GNU tar 1.35 exit 2, but only after it has written a
+#   partial tree — ioq3ded landed at 634880 bytes against a real 868248. `set -e`
+#   stops the copy, so /opt survives, but again the unit is already down.
+#
+# Neither has actually happened. The journal shows every stop either matching a
+# shutdown in `last` or followed by a start within seconds. This is a fix for a
+# reading of the script, not for an outage anyone has had.
+#
+# No release ships a checksum, so tar's gzip CRC is the only integrity check
+# there is. That is what catches truncation, and it now runs while the servers
+# are still up.
+cmd_deploy() {
+  local games="${1:-all}"
+  [ "$games" = "all" ] && games="$ALL_GAMES"
+
+  # ---- phase 1: resolve every asset. Nothing is stopped until this passes.
+  local plan="" g
+  for g in $games; do
+    local repo tag stem asset url
+    repo=$(ghrepo "$g"); tag=$(ghtag "$g"); stem=$(tarstem "$g")
+    asset="${stem}-linux-aarch64.tar.gz"
+    url=$(gh release view "$tag" --repo "matthewdeaves/$repo" --json assets \
+          -q ".assets[] | select(.name==\"$asset\") | .url" 2>/dev/null) || true
+    [ -n "$url" ] || die "no asset $asset in $repo@$tag — nothing was stopped"
+    echo "==> $g: $asset"
+    plan="$plan$g $url"$'\n'
+  done
+
+  # ---- phase 2: fetch, unpack and check, with every server still running.
+  #
+  # Fetched on the server, not proxied through this Mac — the box has a
+  # datacentre link and this Mac does not. Unpacked as the login user; only the
+  # install into /opt needs root. Untarring under sudo leaves root-owned files
+  # the cleanup cannot remove, which fails the whole run for no reason.
+  local stage="/tmp/retro-deploy.$$"
+  "${SSH[@]}" "rm -rf $stage && mkdir -p $stage"
+  while read -r g url; do
+    [ -n "$g" ] || continue
+    local bin tag ver; bin=$(binary "$g"); tag=$(ghtag "$g"); ver="${tag#server-}"
+    "${SSH[@]}" "set -e
+      s=$stage/$g
+      mkdir -p \$s
+      curl -fsSL '$url' -o \$s/a.tar.gz
+      tar xzf \$s/a.tar.gz -C \$s || { echo 'the tarball did not unpack — short or corrupt download'; exit 1; }
+      src=\$(find \$s -mindepth 1 -maxdepth 1 -type d | head -1)
+      [ -n \"\$src\" ] || { echo 'tarball had no top-level directory'; exit 1; }
+      [ -s \"\$src/$bin\" ] || { echo 'no $bin in the tarball, or it is empty'; exit 1; }
+      [ -x \"\$src/$bin\" ] || { echo '$bin is not executable'; exit 1; }
+      # The tag says which build this is meant to be. BUILD-INFO.txt says which
+      # build it actually is. They have disagreed before.
+      if [ -f \"\$src/BUILD-INFO.txt\" ]; then
+        got=\$(awk -F': *' '/^Version/ {print \$2; exit}' \"\$src/BUILD-INFO.txt\")
+        [ \"\$got\" = \"$tag\" ] || [ \"\$got\" = \"$ver\" ] || {
+          echo \"tarball says it is \$got but the pin asked for $tag\"; exit 1; }
+      fi
+      echo \"\$src\" > \$s/src" \
+      || { "${SSH[@]}" "sudo rm -rf $stage" || true
+           die "$g: the release did not check out — nothing was stopped"; }
+    echo "    staged and checked, $(unit "$g") still running"
+  done <<< "$plan"
+
+  # ---- phase 3: swap. A unit is down only for the length of one copy.
+  #
+  # A running binary cannot be overwritten — cp fails with "Text file busy" —
+  # which is the only reason a stop is needed at all.
+  while read -r g url; do
+    [ -n "$g" ] || continue
+    local d u; d=$(dir "$g"); u=$(unit "$g")
+    echo "==> installing $g"
+    "${SSH[@]}" "set -e
+      s=$stage/$g
+      src=\$(cat \$s/src)
+      # Keep only the files this tarball is about to land on. The install tree
+      # also holds game content — hundreds of megabytes of it — and copying
+      # that aside would be slow and pointless.
+      (cd \"\$src\" && find . -type f -printf '%P\n') | while read -r f; do
+        if sudo test -f \"$d/\$f\"; then
+          mkdir -p \"\$s/backup/\$(dirname \"\$f\")\"
+          sudo cp -a \"$d/\$f\" \"\$s/backup/\$f\"
+        fi
+      done
+      sudo systemctl stop $u 2>/dev/null || true
+      sudo mkdir -p $d
+      sudo cp -a \"\$src\"/. $d/
+      sudo find $d -maxdepth 2 -name '*.service' -exec cp {} /etc/systemd/system/ \;
+      sudo systemctl daemon-reload"
+    echo "    installed to $d"
+  done <<< "$plan"
+
+  echo "==> local overrides"
+  cmd_dropins
+
+  while read -r g url; do
+    [ -n "$g" ] || continue
+    local d u; d=$(dir "$g"); u=$(unit "$g")
+    "${SSH[@]}" "sudo systemctl start $u" || true
+    # `systemctl start` returns as soon as the process is forked, so it says
+    # nothing about whether the binary survived. Ask again once it has had a
+    # moment to fall over.
+    sleep 3
+    if "${SSH[@]}" "systemctl is-active --quiet $u"; then
+      echo "    started $u"
+    else
+      echo "    $u did not stay up — putting the old files back" >&2
+      "${SSH[@]}" "set -e
+        b=$stage/$g/backup
+        [ -d \$b ] || { echo 'nothing was backed up'; exit 1; }
+        (cd \$b && find . -type f -printf '%P\n') | while read -r f; do
+          sudo cp -a \"\$b/\$f\" \"$d/\$f\"
+        done
+        sudo find $d -maxdepth 2 -name '*.service' -exec cp {} /etc/systemd/system/ \;
+        sudo systemctl daemon-reload
+        sudo systemctl start $u" >&2
+      # Same trap as the primary start above, and it bit for real on
+      # 2026-08-28: `systemctl start` returning 0 only means the rollback
+      # restart was ISSUED, not that the old binary stayed up. This used to
+      # print "rolled back" unconditionally right after that command. For a
+      # release that renamed its binary and shipped a new unit
+      # (alephone-server, server-v1.0.0), nothing relevant matched an
+      # existing path, so the backup step had nothing to back up, the
+      # restore loop had nothing to restore, and the tool declared victory
+      # while the service sat crash-looping on the broken new build.
+      # Required a manual fix on the box. Re-check, exactly like the
+      # primary path does.
+      sleep 3
+      "${SSH[@]}" "sudo rm -rf $stage" || true
+      if "${SSH[@]}" "systemctl is-active --quiet $u"; then
+        die "$g: the new build would not stay up. Rolled back — $u is running the previous build."
+      else
+        die "$g: the new build would not stay up, AND the rollback did not leave $u running either. The box is likely down for this game right now — check and fix it by hand before doing anything else."
+      fi
+    fi
+  done <<< "$plan"
+
+  "${SSH[@]}" "sudo rm -rf $stage" || true
+
+  # A deploy is the one moment the Quake console drop-in can be lost — a shipped
+  # unit is copied over the old one and the drop-in has to be re-applied on top.
+  # Prove it took rather than assuming cmd_dropins was enough.
+  case " $games " in *" quake "*)
+    echo "==> checking Quake's console survived the deploy"
+    sleep 3
+    console_canary || die "deploy left Quake's console dead — see above" ;;
+  esac
+}
+
+cmd_content() {
+  local g="${1:?usage: retro content <game>}"
+  local src dst gd
+  src=$(content_src "$g"); gd=$(gamedir "$g"); dst="$(dir "$g")/$gd"
+  [ -d "$src" ] || die "no content at $src"
+  echo "==> $g: $(du -sh "$src" | cut -f1) from $src"
+  echo "    to $RETRO_SERVER_IP:$dst"
+  "${SSH[@]}" "sudo mkdir -p $dst && sudo chown -R $RETRO_SSH_USER $dst"
+  # Never sync executables.
+  #
+  # The srv-build content directories are smoke-test trees from an x86_64 box,
+  # so they contain engine artifacts as well as game content. Quake II's game
+  # DLL is called plain `game.so` with no architecture in the name, so an
+  # unfiltered rsync silently replaces the aarch64 one from the release with an
+  # x86-64 one, and the server then dies with
+  #   LoadLibrary (baseq2/game.so): cannot open shared object file
+  # which is a confusing way for the kernel to say "wrong architecture".
+  #
+  # Half-Life survives this by accident — Xash names its libs hl_arm64.so and
+  # hl_amd64.so, so they coexist. Do not rely on that.
+  rsync -avP --no-perms --no-owner --no-group \
+    --exclude='*.so' --exclude='*.dll' --exclude='*.dylib' \
+    --exclude='qconsole.log' --exclude='.DS_Store' \
+    -e "ssh -i $SSH_KEY -o BatchMode=yes" \
+    "$src/" "$RETRO_SSH_USER@$RETRO_SERVER_IP:$dst/"
+  local owner; owner=$(basename "$(dir "$g")" | sed 's/-server//;s/quakespasm/quake/;s/half-life/halflife/')
+  "${SSH[@]}" "sudo chown -R $owner:$owner $(dir "$g")"
+  echo "    done"
+}
+
+# The repo is the source of truth, so anything on the box that the repo owns
+# had better be byte-identical to it. This says so, out loud, rather than
+# leaving you to wonder. Anything that has drifted was changed by hand, and
+# will be lost the next time the box is rebuilt.
+cmd_drift() {
+  local bad=0
+  _cmp() {
+    local lf="$1" rcmd="$2" name="$3" L R
+    L=$(shasum -a 256 "$lf" 2>/dev/null | cut -d' ' -f1)
+    R=$("${SSH[@]}" "$rcmd" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$R" ]; then printf "  %-40s %s\n" "$name" "MISSING ON BOX"; bad=1
+    elif [ "$L" = "$R" ]; then printf "  %-40s %s\n" "$name" "same"
+    else printf "  %-40s %s\n" "$name" "DRIFTED"; bad=1; fi
+  }
+  echo "comparing the box with this checkout"
+  _cmp "$REPO_ROOT/admin/retro-admin.py"      "sha256sum /opt/retro-admin/retro-admin.py"        "admin/retro-admin.py"
+  _cmp "$REPO_ROOT/admin/app.css"             "sha256sum /opt/retro-admin/app.css"               "admin/app.css"
+  _cmp "$REPO_ROOT/admin/app.js"              "sha256sum /opt/retro-admin/app.js"                "admin/app.js"
+  _cmp "$REPO_ROOT/admin/live.js"             "sha256sum /opt/retro-admin/live.js"               "admin/live.js"
+  _cmp "$REPO_ROOT/admin/sw.js"               "sha256sum /opt/retro-admin/sw.js"                 "admin/sw.js"
+  _cmp "$REPO_ROOT/admin/retro-admin.service" "sha256sum /etc/systemd/system/retro-admin.service" "admin/retro-admin.service"
+  _cmp "$REPO_ROOT/admin/retro-admin.sudoers" "sudo sha256sum /etc/sudoers.d/retro-admin"        "admin/retro-admin.sudoers"
+  for f in "$REPO_ROOT/admin/art"/*.png; do
+    _cmp "$f" "sha256sum /opt/retro-admin/art/$(basename "$f")" "admin/art/$(basename "$f")"
+  done
+  for unitdir in "$REPO_ROOT/dropins"/*.service.d; do
+    [ -d "$unitdir" ] || continue
+    local unit; unit=$(basename "$unitdir")
+    for f in "$unitdir"/*.conf; do
+      local rendered; rendered=$(_render_dropin "$f")
+      _cmp "$rendered" "sha256sum /etc/systemd/system/$unit/$(basename "$f")" "dropins/$unit/$(basename "$f")"
+      rm -f "$rendered"
+    done
+  done
+
+  echo
+  echo "drop-ins on the box that this repo does not own:"
+  local known stray
+  known=$(cd "$REPO_ROOT/dropins" 2>/dev/null && for d in *.service.d; do
+            for f in "$d"/*.conf; do echo "$d/$f"; done; done | sed "s|/[^/]*/|/|")
+  stray=$("${SSH[@]}" 'for d in /etc/systemd/system/*.service.d; do
+            for f in "$d"/*.conf; do [ -e "$f" ] && echo "$(basename $d)/$(basename $f)"; done; done' 2>/dev/null \
+          | grep -v "^iscsid" || true)
+  local untracked=0
+  for s in $stray; do
+    if ! printf "%s\n" "$known" | grep -qx "$s"; then
+      printf "  %-40s %s\n" "$s" "UNTRACKED"; bad=1; untracked=1
+    fi
+  done
+  [ "$untracked" -eq 0 ] && echo "  none"
+
+  echo
+  # ------------------------------------------------- 3. the game servers
+  #
+  # #7. Everything above compares FILES this repo ships. The checkout also
+  # pins four server versions in the game table (bin/retro:62-65), and until
+  # now nothing compared a pin with what was installed -- so a box running an
+  # older tag, or a hand-copied binary, reported no drift at all.
+  #
+  # That made the closing line below a clean result that had examined less
+  # than it claimed, which is worse than no check: it turns an unknown into a
+  # false assurance.
+  #
+  # One ssh round trip for all four rather than one each. BUILD-INFO.txt is
+  # the same file `retro deploy` parses at :340-344, and the pin matches
+  # either form -- the tag `server-v1.17` or the bare version `v1.17`.
+  echo "game servers, pin against BUILD-INFO.txt on the box:"
+  local vers pairs
+  pairs=$(for g in $ALL_GAMES; do printf '%s:%s ' "$g" "$(dir "$g")"; done)
+  vers=$("${SSH[@]}" "for p in $pairs; do
+      n=\${p%%:*}; d=\${p#*:}
+      v=\$(awk -F': *' '/^Version/ {print \$2; exit}' \"\$d/BUILD-INFO.txt\" 2>/dev/null)
+      echo \"\$n \${v:-NONE}\"
+    done" 2>/dev/null)
+  for g in $ALL_GAMES; do
+    local tag ver got
+    tag=$(ghtag "$g"); ver="${tag#server-}"
+    got=$(printf '%s\n' "$vers" | awk -v n="$g" '$1==n {print $2; exit}')
+    if [ -z "$got" ] || [ "$got" = "NONE" ]; then
+      printf "  %-40s %s\n" "$g server" "NO BUILD-INFO ON BOX"; bad=1
+    elif [ "$got" = "$tag" ] || [ "$got" = "$ver" ]; then
+      printf "  %-40s %s\n" "$g server" "same ($got)"
+    else
+      printf "  %-40s %s\n" "$g server" "DRIFTED (box $got, pin $tag)"; bad=1
+    fi
+  done
+
+  echo
+  # The hashes above prove the override FILE is right. They cannot prove the
+  # unit was restarted to pick it up, and an override that is present but not
+  # loaded looks identical to one that is working.
+  console_canary || bad=1
+  allowlist_canary || bad=1
+  engine_canary || bad=1
+
+  echo
+  if [ "$bad" -ne 0 ]; then
+    echo "the box and the repo disagree. The repo wins: run retro admin / retro deploy /" >&2
+    echo "retro dropins, or copy the box's version into the repo if the box is right." >&2
+    return 1
+  fi
+  # Says what it checked, not more. The old wording -- "the box is exactly
+  # what this checkout says it should be" -- was true of the files and silent
+  # about the four servers, which is exactly the gap #7 was about. Naming what
+  # is still unchecked is the point: a clean result that overstates its reach
+  # is the failure this whole check exists to avoid.
+  echo "no drift: every tracked file and all four server versions match this checkout"
+  echo "  not checked: whether a server binary was built from the source its version"
+  echo "  claims. This repo builds nothing and cannot attest that."
+}
+
+# Lay the local overrides on top of the units that came out of the tarballs.
+# Not cosmetic: without the quakespasm one that server ignores every command it
+# is ever sent. See dropins/README.md.
+# ------------------------------------------------------ quake console canary
+#
+# A Quake console that is not listening reports success at every layer above it
+# — tee, this script, the web admin — because a write into a FIFO nobody reads
+# still succeeds. It cannot be proven cheaply, only disproven, and QuakeSpasm
+# disproves it for free in three different ways at startup. All three are worth
+# reading, because each one is a different way to end up with the same silence:
+#
+#   "Terminal input not available."
+#       stdin is neither a terminal nor a FIFO. Nothing will ever be read.
+#       Before old-mac-quakespasm#11 this was every FIFO, which is why the
+#       drop-in wraps the engine in a pty.
+#
+#   "Console input: no writer on the FIFO. ..."
+#       The engine has the #11 fix and the FIFO is opened read-only, so it
+#       reads EOF between commands. The engine now survives that, but it is
+#       still a misconfigured unit: ExecStart must hold the FIFO open
+#       read-write (exec 3<>). Added in old-mac-quakespasm 1d594015 after this
+#       was found by review — the read-only case printed the REASSURING line
+#       below and then discarded everything, so asserting only that line is
+#       present would have passed a console that was throwing commands away.
+#
+#   "Console input: reading commands from a pipe."
+#       The good path on a fixed engine: reading the FIFO directly, no pty.
+#       Its presence also proves the running binary carries the #11 fix.
+#
+# Scoped to the CURRENT invocation on purpose: the journal still carries the
+# first line from every run before the pty override landed.
+console_canary() {
+  local raw dead pipe nowriter
+  # One journal read, three greps, one tagged line back. The tag matters: a
+  # motd, a sudo notice or a warning on the way through would otherwise be
+  # mistaken for the answer, and `[ x -gt 0 ]` on a non-integer prints an error
+  # and evaluates as FALSE — reporting a console it could not read as healthy.
+  # Fail closed instead; an unreadable journal is a failure, not a pass.
+  raw=$("${SSH[@]}" 'inv=$(systemctl show -p InvocationID --value quakespasm-server 2>/dev/null); \
+       [ -n "$inv" ] || exit 9; \
+       j=$(sudo journalctl -u quakespasm-server --no-pager _SYSTEMD_INVOCATION_ID="$inv" 2>/dev/null) || exit 9; \
+       [ -n "$j" ] || exit 9; \
+       d=$(printf "%s\n" "$j" | grep -ic "Terminal input not available" || true); \
+       p=$(printf "%s\n" "$j" | grep -ic "reading commands from a pipe" || true); \
+       w=$(printf "%s\n" "$j" | grep -ic "no writer on the FIFO" || true); \
+       printf "CANARY %s %s %s\n" "$d" "$p" "$w"' 2>/dev/null | grep '^CANARY ' | tail -1)
+  read -r _ dead pipe nowriter <<<"${raw:-}"
+  # Each field checked SEPARATELY, and an empty one counts as garbage. A reply
+  # that arrived truncated ("CANARY 0") passes a test on the three concatenated
+  # together, and then `[ "" -gt 0 ]` prints an error and evaluates FALSE, so
+  # the two unread signals fall through to the success line at the bottom. That
+  # is precisely the failure this function exists to catch, so it must not be
+  # the way this function itself fails.
+  for _f in "${dead:-}" "${pipe:-}" "${nowriter:-}"; do
+    case "$_f" in
+      *[!0-9]* | "")
+        printf "  %-40s %s\n" "quake console" "UNKNOWN"
+        echo "    could not read quakespasm-server's journal, so the console is unproven." >&2
+        echo "    Treating that as a failure on purpose: the whole point of this check is" >&2
+        echo "    that a Quake console reports success whether or not it is listening." >&2
+        return 1 ;;
+    esac
+  done
+  if [ "$dead" -gt 0 ]; then
+    printf "  %-40s %s\n" "quake console" "DEAD"
+    echo "    QuakeSpasm reported 'Terminal input not available.' on this run, so it is" >&2
+    echo "    reading nothing from the FIFO. Every command sent to Quake will be thrown" >&2
+    echo "    away while every tool reports success. The pty drop-in is missing or was" >&2
+    echo "    overwritten: run 'retro dropins', then 'retro restart quake'." >&2
+    return 1
+  fi
+  if [ "$nowriter" -gt 0 ]; then
+    printf "  %-40s %s\n" "quake console" "MISCONFIGURED"
+    echo "    QuakeSpasm reported 'no writer on the FIFO'. The engine has the #11 fix and" >&2
+    echo "    is still reading, but the unit opens the console read-only, so a command" >&2
+    echo "    that arrives while the engine is mid-line can be lost. ExecStart must hold" >&2
+    echo "    the FIFO open read-write: 'exec 3<>/run/quakespasm-server/console'." >&2
+    return 1
+  fi
+  if [ "$pipe" -gt 0 ]; then
+    printf "  %-40s %s\n" "quake console" "alive, reading the FIFO directly"
+    return 0
+  fi
+  # Nothing matched. Until server-v1.17 that meant the pty drop-in was doing
+  # its job, and it was the pass. It is now a FAILURE, because the pty is gone:
+  # a v1.17 engine reading the FIFO says so on every start, so silence means
+  # either an older binary that never had the fix, or an engine that printed
+  # nothing at all. Both are consoles that cannot be trusted, and the whole
+  # reason this function exists is that an untrustworthy console looks exactly
+  # like a working one from every layer above it.
+  printf "  %-40s %s\n" "quake console" "UNPROVEN"
+  echo "    QuakeSpasm printed none of the three console lines on this run. Since" >&2
+  echo "    server-v1.17 the good path announces itself, so silence means the binary" >&2
+  echo "    predates the fix or did not start cleanly. Check what is installed:" >&2
+  echo "    'retro deploy quake' installs the pinned release." >&2
+  return 1
+}
+
+# -------------------------------------------------- persisted-grant canary
+#
+# No access grant may exist in /etc/nftables.conf. Grants live in the running
+# kernel with a timeout on them; the file on disk is replayed verbatim by
+# nftables.service at every boot, so an element written into it is a permanent
+# grant that merely looks temporary -- e.g. `/etc/nftables.conf` overwritten
+# with a dump of the *live* ruleset captures a grant mid-flight, timeout and
+# all (`elements = { 203.0.113.5 timeout 12h expires 11h43m56s958ms }`), and
+# every boot after that silently re-opens the game ports and port 22 to that
+# address for another 12h, forever. It defeats the entire design: the timeout
+# exists because admins are on residential connections that renumber, so the
+# address you granted is one you may stop owning, and a grant that re-arms
+# itself at every boot outlives that.
+allowlist_canary() {
+  local n
+  # Count, don't match: grep -c returns 1 when it finds nothing, and `|| true`
+  # on a bare grep would make "could not read the file" indistinguishable from
+  # "the file is clean" — the same false-success shape as the console.
+  # The readability test has to run under sudo too. It did not, first time
+  # round: the file is root-only, so the check reported UNKNOWN on a box whose
+  # ruleset was in fact clean. Fail-closed made that a visible wrong answer
+  # instead of a silent right-looking one, which is the point of it.
+  #
+  # Tagged, because grep -c prints 0 AND exits 1 when it finds nothing, so an
+  # exit status cannot tell "clean file" from "no file".
+  n=$("${SSH[@]}" 'sudo test -r /etc/nftables.conf || exit 9; \
+       printf "GRANTS %s\n" "$(sudo grep -cE "^[[:space:]]*elements[[:space:]]*=" /etc/nftables.conf)"' \
+       2>/dev/null | grep "^GRANTS " | tail -1 | awk "{print \$2}")
+  case "$n" in
+    ""|*[!0-9]*)
+      printf "  %-40s %s\n" "persisted grants" "UNKNOWN"
+      echo "    could not read /etc/nftables.conf, so it is unproven whether a grant is" >&2
+      echo "    baked into the ruleset that is replayed at every boot." >&2
+      return 1 ;;
+    0)
+      printf "  %-40s %s\n" "persisted grants" "none, as intended"
+      return 0 ;;
+    *)
+      printf "  %-40s %s\n" "persisted grants" "$n FOUND"
+      echo "    /etc/nftables.conf contains $n set element(s). That file is replayed by" >&2
+      echo "    nftables.service at every boot, so each one is a permanent grant wearing" >&2
+      echo "    a timeout's clothes — it comes back with a full TTL every time the box" >&2
+      echo "    starts. Someone has saved a live ruleset over the file. Remove the" >&2
+      echo "    'elements = { ... }' lines; do NOT reload nftables while you are on SSH" >&2
+      echo "    unless your address is in a set that survives it." >&2
+      return 1 ;;
+  esac
+}
+
+cmd_dropins() {
+  local d="$REPO_ROOT/dropins"
+  [ -d "$d" ] || die "no dropins directory"
+  for unitdir in "$d"/*.service.d; do
+    [ -d "$unitdir" ] || continue
+    local unit; unit=$(basename "$unitdir")
+    "${SSH[@]}" "sudo mkdir -p /etc/systemd/system/$unit"
+    for f in "$unitdir"/*.conf; do
+      local rendered; rendered=$(_render_dropin "$f")
+      scp -q -i "$SSH_KEY" -o BatchMode=yes "$rendered" \
+        "$RETRO_SSH_USER@$RETRO_SERVER_IP:/tmp/$(basename "$f")"
+      rm -f "$rendered"
+      "${SSH[@]}" "sudo install -o root -g root -m 0644 /tmp/$(basename "$f") \
+        /etc/systemd/system/$unit/$(basename "$f") && rm -f /tmp/$(basename "$f")"
+      echo "    $unit/$(basename "$f")"
+    done
+  done
+  "${SSH[@]}" "sudo systemctl daemon-reload"
+  echo "drop-ins installed. Restart the affected units to pick them up."
+}
+
+# Prove the controls actually do something, by reading each change back out of
+# the engine. DESTRUCTIVE: it changes modes, maps and settings on every server,
+# and restarts Quake II. Not part of the deploy gate for exactly that reason.
+cmd_verify() {
+  # Bare `retro verify quake3` used to run every game regardless -- the
+  # argument was silently ignored, and nothing checked for a real player
+  # first despite verify.py's own "Not during a game" warning, which restarted
+  # a live server mid-game. Now it actually filters to the named game, and
+  # refuses outright if a real (non-bot) player is connected to any game it
+  # is about to touch, unless told --force.
+  local game="" force="0"
+  for a in "$@"; do
+    case "$a" in
+      --force) force="1" ;;
+      "")      ;;
+      *)       game="$a" ;;
+    esac
+  done
+  local src="$REPO_ROOT/admin"
+  scp -q -i "$SSH_KEY" -o BatchMode=yes "$src/verify.py" \
+    "$RETRO_SSH_USER@$RETRO_SERVER_IP:/tmp/verify.py"
+  "${SSH[@]}" -t "sudo -u retroadmin STATE_DIRECTORY=/tmp/retro-verify-state \
+    python3 /tmp/verify.py /opt/retro-admin/retro-admin.py '$game' '$force'; rc=\$?
+    rm -f /tmp/verify.py; sudo rm -rf /tmp/retro-verify-state
+    exit \$rc"
+}
+
+# Exercise a candidate admin UI on the box before trusting it. It has to run
+# there: the checks look at real game content, and there is none on a laptop.
+cmd_selftest() {
+  local src="$REPO_ROOT/admin"
+  # Every script the browser will run, checked before it is ever served.
+  if command -v node >/dev/null 2>&1; then
+    node --check "$src/app.js"  || die "app.js does not parse"
+    node --check "$src/live.js" || die "live.js does not parse"
+    node --check "$src/sw.js"   || die "sw.js does not parse"
+  else
+    echo "note: node not installed, skipping the JavaScript syntax check" >&2
+  fi
+  scp -q -i "$SSH_KEY" -o BatchMode=yes \
+    "$src/retro-admin.py" "$src/selftest.py" "$src/app.css" "$src/app.js" "$src/live.js" "$src/sw.js" \
+    "$RETRO_SSH_USER@$RETRO_SERVER_IP:/tmp/"
+  "${SSH[@]}" "rm -rf /tmp/retro-selftest-art && mkdir -p /tmp/retro-selftest-art"
+  scp -q -i "$SSH_KEY" -o BatchMode=yes \
+    "$src/art"/*.png "$RETRO_SSH_USER@$RETRO_SERVER_IP:/tmp/retro-selftest-art/"
+  # selftest.py imports the module by path and the module looks for its art
+  # next to itself, so both have to sit in the same directory.
+  "${SSH[@]}" "set -e
+    rm -rf /tmp/retro-selftest && mkdir -p /tmp/retro-selftest/art
+    mv /tmp/retro-admin.py /tmp/selftest.py /tmp/app.css /tmp/app.js /tmp/live.js /tmp/sw.js /tmp/retro-selftest/
+    mv /tmp/retro-selftest-art/*.png /tmp/retro-selftest/art/
+    rmdir /tmp/retro-selftest-art
+    rm -rf /tmp/retro-selftest-state
+    rc=0
+    python3 /tmp/retro-selftest/selftest.py /tmp/retro-selftest/retro-admin.py 2>/dev/null || rc=\$?
+    rm -rf /tmp/retro-selftest /tmp/retro-selftest-state
+    exit \$rc"
+}
+
+# The web admin itself. This used to go up by hand over scp, which is how a
+# broken build once reached the box: nothing checked it parsed first, and a
+# 502 was the first sign. Parse it locally, upload, restart, then read the
+# health endpoint back and roll the old copy in again if it does not answer.
+cmd_admin() {
+  local src="$REPO_ROOT/admin"
+  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$src/retro-admin.py" \
+    || die "retro-admin.py does not parse — not deploying it"
+
+  # Render every page and fetch every image the pages point at, using the
+  # candidate code, before any of it is installed. Parsing proves nothing about
+  # whether the thing renders.
+  if [ "${1:-}" != "--skip-selftest" ]; then
+    cmd_selftest | grep -vE "^retro-admin:" || die "selftest failed — not deploying"
+  fi
+
+  scp -q -i "$SSH_KEY" -o BatchMode=yes \
+    "$src/retro-admin.py" "$src/retro-admin.service" "$src/retro-admin.sudoers" \
+    "$src/app.css" "$src/app.js" "$src/live.js" "$src/sw.js" \
+    "$RETRO_SSH_USER@$RETRO_SERVER_IP:/tmp/"
+  # The overview tile icons. They sit next to the script because that is where
+  # it looks for them; without them the emblems silently fall back to whatever
+  # can be dug out of the game paks, which is much worse and easy not to
+  # notice.
+  "${SSH[@]}" "rm -rf /tmp/retro-art && mkdir -p /tmp/retro-art"
+  scp -q -i "$SSH_KEY" -o BatchMode=yes \
+    "$src/art"/*.png "$RETRO_SSH_USER@$RETRO_SERVER_IP:/tmp/retro-art/"
+
+  "${SSH[@]}" "set -e
+    sudo cp /opt/retro-admin/retro-admin.py /tmp/retro-admin.prev 2>/dev/null || true
+    sudo install -o root -g root -m 0755 -d /opt/retro-admin
+    sudo install -o root -g root -m 0644 /tmp/retro-admin.py /opt/retro-admin/retro-admin.py
+    sudo install -o root -g root -m 0644 /tmp/app.css /tmp/app.js /tmp/live.js /tmp/sw.js /opt/retro-admin/
+    rm -f /tmp/app.css /tmp/app.js /tmp/live.js /tmp/sw.js
+    sudo install -o root -g root -m 0755 -d /opt/retro-admin/art
+    sudo install -o root -g root -m 0644 /tmp/retro-art/*.png /opt/retro-admin/art/
+    rm -rf /tmp/retro-art
+    sudo install -o root -g root -m 0644 /tmp/retro-admin.service /etc/systemd/system/retro-admin.service
+    # visudo -c on a COPY: a bad sudoers file locks everyone out of sudo, and
+    # this script needs sudo to put a good one back.
+    sudo visudo -cf /tmp/retro-admin.sudoers
+    sudo install -o root -g root -m 0440 /tmp/retro-admin.sudoers /etc/sudoers.d/retro-admin
+    rm -f /tmp/retro-admin.py /tmp/retro-admin.service /tmp/retro-admin.sudoers
+    sudo systemctl daemon-reload
+    sudo systemctl restart retro-admin"
+
+  local code
+  code=$("${SSH[@]}" "sleep 2; curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz || true")
+  if [ "$code" = "200" ]; then
+    echo "admin UI deployed and answering on /healthz"
+    "${SSH[@]}" "sudo rm -f /tmp/retro-admin.prev"
+  else
+    echo "healthz returned '$code' — rolling back" >&2
+    "${SSH[@]}" "set -e
+      [ -f /tmp/retro-admin.prev ] || { echo 'no previous copy to restore'; exit 1; }
+      sudo install -o root -g root -m 0644 /tmp/retro-admin.prev /opt/retro-admin/retro-admin.py
+      sudo systemctl restart retro-admin"
+    die "rolled back to the previous admin UI"
+  fi
+}
+
+# Stopping saves nothing — Always Free compute is free running 24/7 and the
+# boot volume counts against the allowance either way. It is here because it
+# is occasionally what you want, not because it reduces a bill that is already
+# zero. Note the public IP is ephemeral: if it changes on start, run dns-sync.
+_instance_id() {
+  oci compute instance list --compartment-id "$RETRO_TENANCY_OCID" \
+    --query 'data[?"lifecycle-state"!=`TERMINATED`].id|[0]' --raw-output
+}
+
+cmd_box_stop() {
+  local id; id=$(_instance_id) || die "could not find the instance"
+  echo "stopping $id"
+  oci compute instance action --instance-id "$id" --action SOFTSTOP --wait-for-state STOPPED >/dev/null
+  echo "stopped. games and admin UI are down until: retro box start"
+}
+
+cmd_box_start() {
+  local id; id=$(_instance_id) || die "could not find the instance"
+  oci compute instance action --instance-id "$id" --action START --wait-for-state RUNNING >/dev/null
+  local ip
+  ip=$(oci compute instance list-vnics --instance-id "$id" --query 'data[0]."public-ip"' --raw-output)
+  echo "running at $ip"
+  if [ "$ip" != "$RETRO_SERVER_IP" ]; then
+    echo "IP CHANGED (.env says $RETRO_SERVER_IP) — updating DNS and .env"
+    sed -i.bak "s/^RETRO_SERVER_IP=.*/RETRO_SERVER_IP=$ip/" "$REPO_ROOT/.env"
+    cmd_dns_sync "$ip"
+  fi
+}
+
+cmd_dns_sync() {
+  local ip="${1:-}"
+  [ -n "$ip" ] || ip=$(oci compute instance list-vnics --instance-id "$(_instance_id)" \
+      --query 'data[0]."public-ip"' --raw-output)
+  echo "pointing DNS at $ip"
+  ( cd "$REPO_ROOT/terraform/cloudflare" \
+    && sed -i.bak "s/^server_ip = .*/server_ip = \"$ip\"/" terraform.tfvars \
+    && CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-$(cat ~/.cloudflare/token)}" \
+       tofu apply -auto-approve -no-color | tail -3 )
+  # The Quake unit pins -ip so NetQuake stops advertising 127.0.1.1 on Ubuntu.
+  echo "remember: the quakespasm -ip drop-in also names the address"
+}
+
+# ------------------------------------------------------------------ game data
+#
+# The paks and wads, one zip per game, pushed to /srv/game-data so the admin UI
+# can hand them to whichever of us needs them. Not in git — 2.2 GB has no place
+# there — but in game-data/ beside this checkout, which .gitignore keeps out.
+#
+# Two copies exist afterwards and both are load-bearing: this machine's, and
+# the box's, which the boot volume backup then picks up. This is data nobody
+# can re-download, so a single copy is not a copy.
+#
+# rsync with --partial, because 1.6 GB over a residential uplink does not
+# always survive in one go and starting again from zero is how a job like this
+# never finishes.
+cmd_gamedata() {
+  local src="$REPO_ROOT/game-data"
+  [ -d "$src" ] || die "no game-data/ directory beside this checkout"
+  local zips; zips=$(find "$src" -maxdepth 1 -name '*.zip' | sort)
+  [ -n "$zips" ] || die "no zips in $src"
+
+  echo "==> pushing $(printf "%s\n" "$zips" | wc -l | tr -d ' ') archives to /srv/game-data"
+  "${SSH[@]}" 'sudo mkdir -p /srv/game-data && sudo chown "$USER":"$USER" /srv/game-data'
+  # shellcheck disable=SC2086
+  rsync -a --partial --inplace --info=progress2 \
+    -e "ssh -o BatchMode=yes -i $SSH_KEY" \
+    $zips "$RETRO_SSH_USER@$RETRO_SERVER_IP:/srv/game-data/"
+
+  echo "==> hashing on the box"
+  "${SSH[@]}" 'cd /srv/game-data && sha256sum *.zip | sudo tee SHA256SUMS >/dev/null \
+      && sudo chmod 0644 /srv/game-data/*.zip /srv/game-data/SHA256SUMS'
+
+  # Verified by comparing hashes computed independently at each end. A transfer
+  # that reports success and delivers a truncated zip is exactly the shape of
+  # failure this repo keeps running into, and rsync's own exit status has
+  # already told us it was fine.
+  echo "==> verifying"
+  local theirs mine bad=0
+  theirs=$("${SSH[@]}" 'cat /srv/game-data/SHA256SUMS')
+  for f in $zips; do
+    mine=$(shasum -a 256 "$f" | awk '{print $1}')
+    local base; base=$(basename "$f")
+    if printf "%s\n" "$theirs" | grep -q "^$mine  $base\$"; then
+      printf "  %-24s %s\n" "$base" "identical"
+    else
+      printf "  %-24s %s\n" "$base" "MISMATCH"; bad=1
+    fi
+  done
+  [ "$bad" -eq 0 ] || die "at least one archive differs between here and the box"
+  echo "all archives match. Take a fresh image so the backup carries them:"
+  echo "  take a fresh backup image to include them"
+}
+
+# Passing "$@" is load-bearing. Without it `retro ssh '<command>'` dropped the
+# command on the floor and opened an interactive shell instead — the command
+# never ran and nothing said so.
+cmd_ssh() { exec "${SSH[@]}" "$@"; }
+
+usage() { sed -n '3,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  status)    shift; cmd_status "$@" ;;
+  console)   shift; cmd_console "$@" ;;
+  map)       shift; cmd_map "$@" ;;
+  restart)   shift; cmd_restart "$@" ;;
+  start)     shift; cmd_start "$@" ;;
+  stop)      shift; cmd_stop "$@" ;;
+  logs)      shift; cmd_logs "$@" ;;
+  allow)     shift; cmd_allow "$@" ;;
+  revoke)    shift; cmd_revoke "$@" ;;
+  allowlist) shift; cmd_allowlist "$@" ;;
+  deploy)    shift; cmd_deploy "$@" ;;
+  admin)     shift; cmd_admin "$@" ;;
+  selftest)  shift; cmd_selftest "$@" ;;
+  verify)    shift; cmd_verify "$@" ;;
+  dropins)   shift; cmd_dropins "$@" ;;
+  drift)     shift; cmd_drift "$@" ;;
+  content)   shift; cmd_content "$@" ;;
+  ssh)       shift; cmd_ssh "$@" ;;
+  box)       shift
+             case "${1:-}" in
+               stop)  shift; cmd_box_stop "$@" ;;
+               start) shift; cmd_box_start "$@" ;;
+               *) echo "usage: retro box stop|start" >&2; exit 1 ;;
+             esac ;;
+  gamedata)  shift; cmd_gamedata "$@" ;;
+  dns-sync)  shift; cmd_dns_sync "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "unknown command: $1" >&2; usage; exit 1 ;;
+esac

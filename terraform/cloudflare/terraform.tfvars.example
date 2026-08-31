@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+
+# Not secret -- both are on the domain's Overview page, right sidebar.
+account_id = ""
+zone_id    = ""
+
+# Your domain, already added to Cloudflare.
+zone_name = ""
+
+# From `cd ../compute && tofu output -raw public_ip`.
+server_ip = ""
+
+# Who may authenticate to the admin UI. Must match RETRO_ADMIN_EMAILS in .env.
+admin_emails = ["you@example.com"]
