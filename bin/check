@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+#
+# check — static checks for this repo. Run by the pre-commit hook, and safe to
+# run by hand at any time.
+#
+#   bin/check            check the working tree
+#   bin/check --staged   check what is about to be committed
+#
+# Every check here exists because something got through. None of them need the
+# server, so they cost a second and can run on every commit:
+#
+#   1. Python compiles.              Not ast.parse: that is the PARSER, and
+#                                    "return outside function" is raised by
+#                                    the COMPILER. A refactor left a stray
+#                                    `return` at class-body level, this check
+#                                    said ok, and the file only failed when
+#                                    Python on the server tried to run it.
+#   2. JavaScript parses.            A \" inside a Python triple-quoted string
+#                                    was resolved on the way out and served as
+#                                    broken JS. Nothing ran for days.
+#   3. Bash parses.
+#   4. No JavaScript or CSS left inside a Python string literal. That is the
+#      shape of the bug above, so the shape is banned rather than the symptom.
+#   5. Every @@token@@ in a template is substituted somewhere.
+#   6. Every class the markup uses exists in the stylesheet. A patch script
+#      once reported success and wrote nothing, leaving markup referring to CSS
+#      that was never written, which is why the picker had no styling.
+#   7. Nothing that looks like a credential is being committed.
+#   8. If the artwork or the image pipeline changed, ART_REV changed too —
+#      otherwise the old picture survives the deploy and the change looks as
+#      though it did nothing.
+#   9. The service worker does not cache. docs/adr/0002.
+#  10. Every admin/*-test.py passes. These drive logic that no static check
+#      can see: the play log counted the Quake III bots and reported a busy
+#      server every night, and the stop control has to keep a parked server
+#      distinguishable from one that died (docs/adr/0003).
+#
+set -uo pipefail
+
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+STAGED=0
+[ "${1:-}" = "--staged" ] && STAGED=1
+
+FAIL=0
+say()  { printf "  %-52s %s\n" "$1" "$2"; }
+ok()   { say "$1" "ok"; }
+bad()  { say "$1" "FAIL"; [ -n "${2:-}" ] && printf "      %s\n" "$2"; FAIL=1; }
+
+# What are we checking? The working tree, or the index?
+if [ "$STAGED" = 1 ]; then
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  git checkout-index -a --prefix="$work/" 2>/dev/null || { echo "could not read the index" >&2; exit 1; }
+  root="$work"
+  changed=$(git diff --cached --name-only --diff-filter=ACM)
+else
+  root="."
+  changed=$(git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard)
+fi
+
+echo "static checks"
+
+# ------------------------------------------------------------------ 1. Python
+for f in "$root"/admin/*.py; do
+  [ -e "$f" ] || continue
+  if err=$(python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f" 2>&1); then
+    ok "$(basename "$f") compiles"
+  else
+    bad "$(basename "$f") compiles" "$(echo "$err" | tail -2 | tr '\n' ' ')"
+  fi
+done
+
+# -------------------------------------------------------------- 2. JavaScript
+if command -v node >/dev/null 2>&1; then
+  for f in "$root"/admin/*.js; do
+    [ -e "$f" ] || continue
+    if err=$(node --check "$f" 2>&1); then
+      ok "$(basename "$f") parses"
+    else
+      bad "$(basename "$f") parses" "$(echo "$err" | grep -E 'Error|:[0-9]+$|^[^ ]+:[0-9]+' | head -2 | tr '\n' ' ')"
+    fi
+  done
+else
+  say "javascript parses" "skipped, no node"
+fi
+
+# --------------------------------------------------------------------- 3. Bash
+for f in "$root"/bin/*; do
+  [ -f "$f" ] || continue
+  head -1 "$f" | grep -q bash || continue
+  if err=$(bash -n "$f" 2>&1); then
+    ok "$(basename "$f") parses"
+  else
+    bad "$(basename "$f") parses" "$err"
+  fi
+done
+
+# ------------------------------------- 4. no front-end code inside Python
+# The specific failure: Python ate a backslash in an embedded <script>. Keep
+# the browser's languages in the browser's files.
+if grep -nE '^\s*(SCRIPT|CSS|JS|STYLE|REFRESH_JS)\s*=\s*"""' "$root"/admin/*.py 2>/dev/null \
+     | grep -v 'REFRESH_JS = "<script>"' | grep -q .; then
+  bad "no stylesheet or script inside a Python string" \
+      "put it in admin/*.css or admin/*.js and read it with _asset()"
+else
+  ok "no stylesheet or script inside a Python string"
+fi
+
+# -------------------------------------------------- 5. template tokens resolve
+python3 - "$root" <<'PY'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+src = (root / "admin/retro-admin.py").read_text()
+used = set(re.findall(r"@@([a-z0-9_]+)@@", src))
+# A token is fine if it appears in a substitution pair as well as in a template.
+subbed = set(re.findall(r'\("@@([a-z0-9_]+)@@",', src))
+missing = sorted(used - subbed)
+# And the other direction: a substitution whose token no template mentions any
+# more is dead, and usually means a piece of markup was dropped by accident.
+# The live indicator and the host stats disappeared from the page that way.
+orphan = sorted(subbed - used)
+label = "every @@token@@ is substituted, and used"
+if missing or orphan:
+    print("  %-52s FAIL" % label)
+    if missing:
+        print("      never substituted: %s" % ", ".join(missing))
+    if orphan:
+        print("      substituted but in no template: %s" % ", ".join(orphan))
+    sys.exit(1)
+print("  %-52s ok" % label)
+PY
+[ $? -ne 0 ] && FAIL=1
+
+# ------------------------------------------- 6. markup classes exist in the CSS
+python3 - "$root" <<'PY'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+src = (root / "admin/retro-admin.py").read_text()
+css = (root / "admin/app.css").read_text()
+js = "".join((root / n).read_text() for n in ("admin/app.js", "admin/live.js"))
+
+# class=foo and class='foo bar' as written in the Python markup.
+used = set()
+for m in re.findall(r"class=([a-zA-Z][\w-]*)", src):
+    used.add(m)
+for m in re.findall(r"class='([^']*)'", src):
+    for part in m.split():
+        if "%" not in part:
+            used.add(part)
+
+defined = set(re.findall(r"\.([a-zA-Z][\w-]*)", css))
+# Classes the scripts add at runtime are legitimate too.
+defined |= set(re.findall(r'className\s*=\s*"([^"]*)"', js))
+defined |= set(re.findall(r'classList\.(?:add|toggle)\("([^"]*)"', js))
+
+missing = sorted(c for c in used - defined if not c.startswith("@@"))
+label = "every class in the markup exists in the CSS"
+if missing:
+    print("  %-52s FAIL" % label)
+    print("      no rule for: %s" % ", ".join(missing))
+    sys.exit(1)
+print("  %-52s ok" % label)
+
+# Classes are not the only thing markup leans on. A redesign once kept every
+# aria-pressed attribute and dropped the one rule that drew the pressed state,
+# so every On/Off toggle in the app silently lost its selection while looking
+# entirely correct in the HTML.
+label = "state attributes in the markup are styled"
+STATE = ("aria-pressed", "aria-selected", "aria-expanded", "data-hide")
+
+
+def literal_classes(attrs):
+    """Class names as written, with format placeholders stripped.
+
+    `class='tab%s'` is a tab whose class list is built at render time; the
+    literal part is what a stylesheet can actually match on."""
+    out = set()
+    for chunk in re.findall(r"class=\'?([^\'>]*)", attrs):
+        for part in chunk.split():
+            part = re.sub(r"%[sd]", "", part).strip()
+            if part and part.isidentifier() or re.fullmatch(r"[a-zA-Z][\w-]*", part or ""):
+                out.add(part)
+    return out
+
+
+# Search the rules, not the prose: a comment that merely NAMES the rule it is
+# describing made this check pass while the rule itself had been renamed away.
+css_rules = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+unstyled = []
+for name, attrs in re.findall(r"<(\w+)([^<>]*)>", src):
+    for state in STATE:
+        if state + "=" not in attrs and state not in attrs.split():
+            continue
+        names = literal_classes(attrs)
+        # Either a rule for the element itself, or one for a class it carries.
+        covered = ("%s[%s" % (name, state)) in css_rules
+        covered = covered or any((".%s[%s" % (n, state)) in css_rules for n in names)
+        if not covered:
+            unstyled.append("<%s class=%s> %s"
+                            % (name, "/".join(sorted(names)) or "-", state))
+
+unstyled = sorted(set(unstyled))
+if unstyled:
+    print("  %-52s FAIL" % label)
+    for u in unstyled[:6]:
+        print("      nothing styles: %s" % u)
+    sys.exit(1)
+print("  %-52s ok" % label)
+PY
+[ $? -ne 0 ] && FAIL=1
+
+# ------------------------- 6b. no <select> sharing a name with a <button>
+# A <select> submits its value on EVERY submit of its form. A button with the
+# same name arrives second, so parse_qs()[name][0] returns the select's value
+# and the button you actually clicked is ignored.
+#
+# This shipped: every bot face in the Quake III grid, and the Random button,
+# added whichever bot the dropdown happened to be showing. It looks correct in
+# the markup and it fails silently — the wrong bot simply appears.
+python3 - "$root" <<'PY'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+src = (root / "admin/retro-admin.py").read_text()
+label = "no <select> shares a field name with a <button>"
+bad = []
+for form in re.findall(r"<form\b.*?</form>", src, re.S):
+    sels = set(re.findall(r"<select[^>]*\bname=([A-Za-z0-9_]+)", form))
+    btns = set(re.findall(r"<button[^>]*\bname=([A-Za-z0-9_]+)", form))
+    bad.extend(sorted(sels & btns))
+if bad:
+    print("  %-52s FAIL" % label)
+    print("      clashing field name(s): %s" % ", ".join(sorted(set(bad))))
+    print("      give the button its own name; the select always submits too")
+    sys.exit(1)
+print("  %-52s ok" % label)
+PY
+[ $? -ne 0 ] && FAIL=1
+
+# ------------------------------------------------------------- 7. no secrets
+# `.example` files are the tracked templates these are copied FROM, not the
+# real thing -- same reasoning .gitignore already applies to .env.example.
+secrets=$(printf '%s\n' "$changed" | grep -viE '\.example$' | grep -viE '^$' \
+  | grep -iE '\.pem$|\.key$|(^|/)\.env$|oci_api_key|\.tfstate|terraform\.tfvars|/token$' || true)
+if [ -n "$secrets" ]; then
+  bad "no credential files being committed" "$(echo "$secrets" | tr '\n' ' ')"
+else
+  ok "no credential files being committed"
+fi
+
+# In-file key material, whatever the filename says.
+inline=$(grep -rlE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' "$root"/admin "$root"/bin "$root"/terraform 2>/dev/null || true)
+if [ -n "$inline" ]; then
+  bad "no private keys in tracked files" "$inline"
+else
+  ok "no private keys in tracked files"
+fi
+
+# ---------------------------------------------------- 8. ART_REV keeps up
+# Artwork is cached to disk and never re-derived, so a change to a picture or
+# to the code that decodes one is invisible unless the revision moves.
+art_touched=$(printf '%s\n' "$changed" | grep -E '^admin/art/' || true)
+pipeline_touched=$(git diff --cached -U0 -- admin/retro-admin.py 2>/dev/null \
+                   | grep -E '^\+' | grep -cE 'EMBLEMS|_shot_raw|_dechroma|emblem_png|map_shot_png|bot_icon_png' || true)
+rev_touched=$(git diff --cached -U0 -- admin/retro-admin.py 2>/dev/null \
+              | grep -cE '^\+ART_REV' || true)
+if [ "$STAGED" = 1 ] && { [ -n "$art_touched" ] || [ "${pipeline_touched:-0}" -gt 0 ]; } \
+   && [ "${rev_touched:-0}" -eq 0 ]; then
+  bad "ART_REV bumped alongside artwork changes" \
+      "the cached picture will survive the deploy; bump ART_REV in retro-admin.py"
+else
+  ok "ART_REV bumped alongside artwork changes"
+fi
+
+# ------------------------------------------- 9. the service worker may not cache
+# docs/adr/0002. A service worker exists here only to receive push. It is
+# allowed to wake up and show a notification, and nothing else.
+#
+# The reason is that a stale asset is currently IMPOSSIBLE -- the HTML is
+# no-store and the CSS is inlined into it -- and #3 is what that property is
+# worth: a CSS fix went up and was simply there, with no round spent asking
+# whether the phone was showing the old stylesheet. A service worker that
+# intercepts requests would make every future UI bug report ambiguous.
+#
+# A service worker only intercepts anything if it has a `fetch` listener. With
+# none, and with the Cache Storage API untouched, the class stays impossible
+# rather than becoming manageable. That is the whole basis of the decision, so
+# it is checked rather than left to a comment someone erodes in two months.
+sw="$root/admin/sw.js"
+if [ -e "$sw" ]; then
+  # Strip comments first. A `fetch` in prose explaining why there is no fetch
+  # handler must not fail the check, and the previous version of this rule
+  # would have -- which is how a gate that refuses good work gets switched off.
+  body=$(sed -e 's://.*::' "$sw" | tr '\n' ' ' | sed -e 's:/\*[^*]*\*/::g')
+  hits=""
+  printf '%s' "$body" | grep -qE "addEventListener[[:space:]]*\([[:space:]]*['\"]fetch['\"]" \
+    && hits="a fetch listener"
+  printf '%s' "$body" | grep -qE "onfetch[[:space:]]*=" \
+    && hits="${hits:+$hits, }an onfetch assignment"
+  printf '%s' "$body" | grep -qE "\bcaches\b|\bCacheStorage\b" \
+    && hits="${hits:+$hits, }the Cache Storage API"
+  if [ -n "$hits" ]; then
+    bad "service worker does not cache" \
+        "admin/sw.js has $hits — docs/adr/0002 forbids it; push handlers only"
+  else
+    ok "service worker does not cache"
+  fi
+fi
+
+# ------------------------------------------------- 10. the play log records
+# #8. A recorder that quietly records nothing, or that counts the bots
+# top_up() puts in Quake III, produces a full and plausible page that is not
+# about anything anyone did. Static checks cannot see that: the first version
+# of this code compiled, parsed, passed every rule above, and was wrong three
+# times over. So the logic is driven against a scripted evening on a fixed
+# clock, with a bots-only server as the control.
+#
+# No server, no content, no network -- it costs about a second, like the rest.
+# Every admin/*-test.py, so adding one is adding a file rather than editing
+# this. Each imports retro-admin.py, stubs whatever needs the box, and exits
+# non-zero on any failure.
+#
+# The glob is guarded: with no matches, bash leaves the pattern itself and the
+# loop would run once against a file that does not exist. An empty result here
+# has to mean "no tests ran", not "all tests passed".
+ran=0
+for t in "$root"/admin/*-test.py; do
+  [ -e "$t" ] || continue
+  ran=$((ran + 1))
+  name=$(basename "$t" -test.py)
+  if out=$(python3 "$t" "$root/admin/retro-admin.py" 2>&1); then
+    ok "$name behaves"
+  else
+    bad "$name behaves" "$(printf '%s' "$out" | grep -E 'FAIL' | head -5)"
+  fi
+done
+[ "$ran" -eq 0 ] && bad "the admin tests ran" "no admin/*-test.py found"
+
+echo
+if [ "$FAIL" -ne 0 ]; then
+  echo "static checks FAILED"
+  exit 1
+fi
+echo "static checks passed"

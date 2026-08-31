@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#
+# Runs bin/check against what is staged, not against the working tree — so a
+# broken file you have not staged does not block the commit, and a broken file
+# you HAVE staged does.
+#
+# Install with:  ./bin/hooks-install
+# Bypass once with:  git commit --no-verify
+#
+exec "$(git rev-parse --show-toplevel)/bin/check" --staged

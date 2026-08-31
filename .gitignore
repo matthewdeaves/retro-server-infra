@@ -1,0 +1,48 @@
+# Credentials. None of these belong in git, private repo or not.
+*.pem
+*.key
+oci_api_key*
+.env
+.env.*
+!.env.example
+secrets.auto.tfvars
+*.auto.tfvars
+terraform.tfvars
+*.bak
+
+# OpenTofu / Terraform state holds resource attributes in cleartext.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+tfplan
+*.tfplan
+
+# Cloudflare tunnel credentials are a bearer token in JSON form.
+cert.pem
+*.tunnel.json
+
+# Game content. ADR 0012 in the game repos: we ship code, not content.
+content/**/*.pk3
+content/**/*.pak
+content/**/*.wad
+content/**/*.bsp
+*.tar.gz
+
+# macOS
+.DS_Store
+
+# Screenshots taken while working on the UI. Useful, but not repo material.
+.shots/
+
+# The game data itself. 2.2 GB of paks and wads has no business in git, but it
+# lives here so there is a copy on this machine as well as on the box, and so
+# that `retro gamedata` has somewhere to push from. The box's copy is picked up
+# by the boot volume backup, so between the two there are two independent
+# copies of data that cannot be re-downloaded from anywhere.
+game-data/
+
+# Python cache
+__pycache__/
+*.py[cod]

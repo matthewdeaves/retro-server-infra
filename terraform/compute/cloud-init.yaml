@@ -1,0 +1,144 @@
+#cloud-config
+# Brings the box up to the point where the four game servers can be deployed
+# onto it. Deliberately does NOT install the games — that is the deploy step's
+# job, driven from release tarballs.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - nftables
+  - unattended-upgrades
+  - curl
+  - ca-certificates
+
+write_files:
+  # ------------------------------------------------------------------ nftables
+  #
+  # The whole per-source allowlist lives here.
+  #
+  # `players` is a named set with a timeout flag. The admin UI adds entries to
+  # it at runtime once Cloudflare Access has authenticated the caller:
+  #
+  #     nft add element inet filter players { 1.2.3.4 timeout 12h }
+  #
+  # The kernel expires them; nothing has to remember to clean up. That is what
+  # makes an allowlist workable when both admins are on residential
+  # connections whose addresses change.
+  #
+  # Why this matters more than usual: three of the four engines answer
+  # unauthenticated status queries with far more than they were asked for and
+  # have no rate limit of their own. Half-Life measures 101x. An open port here
+  # is a usable DDoS reflector firing under Oracle's addresses, which is both
+  # antisocial and a suspension risk under CSA section 9.3(a).
+  - path: /etc/nftables.conf
+    permissions: "0755"
+    content: |
+      #!/usr/sbin/nft -f
+
+      flush ruleset
+
+      table inet filter {
+        # DELIBERATELY EMPTY.
+        #
+        # This used to be seeded from ssh_ingress_cidrs. That variable is now
+        # 0.0.0.0/0, because SSH filtering moved from the Oracle security list
+        # onto this host — so seeding from it would open port 22 to the entire
+        # internet on every rebuild. It nearly did.
+        #
+        # Nothing is permanent here on purpose either: both admins are on
+        # residential connections that renumber, so a permanent entry is an
+        # address you may not own any more. Access is granted through the admin
+        # UI, which writes into admins_dyn with a timeout, and the genuine
+        # break-glass is Oracle's serial console , which
+        # needs no firewall rule at all.
+        set admins {
+          type ipv4_addr
+          flags interval
+        }
+
+        # SSH grants made through the admin UI. Expiring, like everything else.
+        set admins_dyn {
+          type ipv4_addr
+          flags timeout
+        }
+
+        set players {
+          type ipv4_addr
+          flags timeout
+        }
+
+        set players6 {
+          type ipv6_addr
+          flags timeout
+        }
+
+        chain input {
+          type filter hook input priority filter; policy drop;
+
+          ct state established,related accept
+          ct state invalid drop
+          iif lo accept
+
+          # Path MTU discovery. Dropping these breaks large snapshots in ways
+          # that look like a bad connection rather than a firewall.
+          icmp type { destination-unreachable, time-exceeded, echo-request } accept
+          icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+
+          tcp dport 22 ip saddr @admins accept
+          tcp dport 22 ip saddr @admins_dyn accept
+
+          # Second layer, in case an allowlisted address is itself abused or
+          # spoofed from inside a permitted range. Equivalent to the iptables
+          # hashlimit recipe in the Quake II server README.
+          udp dport { ${join(", ", game_udp_ports)} } \
+            meter gameflood { ip saddr limit rate over 200/second burst 400 packets } \
+            drop
+
+          udp dport { ${join(", ", game_udp_ports)} } ip saddr @players accept
+          udp dport { ${join(", ", game_udp_ports)} } ip6 saddr @players6 accept
+
+          tcp dport 4226 ip saddr @players accept
+          tcp dport 4226 ip6 saddr @players6 accept
+        }
+
+        chain forward {
+          type filter hook forward priority filter; policy drop;
+        }
+
+        chain output {
+          type filter hook output priority filter; policy accept;
+        }
+      }
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+runcmd:
+  # The OCI Ubuntu image ships iptables rules of its own, persisted by
+  # netfilter-persistent. Left in place they shadow everything above and the
+  # result is a firewall nobody can reason about. Take the box off them
+  # entirely rather than trying to make the two agree.
+  - [ systemctl, disable, --now, netfilter-persistent.service ]
+  - [ systemctl, mask, netfilter-persistent.service ]
+  - iptables -F || true
+  - iptables -P INPUT ACCEPT || true
+  - ip6tables -F || true
+  - ip6tables -P INPUT ACCEPT || true
+
+  - [ systemctl, enable, --now, nftables.service ]
+  - [ nft, -f, /etc/nftables.conf ]
+
+  # One unprivileged account per game, matching the User= in each unit file
+  # shipped by the game repos. No login, no home directory.
+  - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, quake ]
+  - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, quake2 ]
+  - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, quake3 ]
+  - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, halflife ]
+  - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, alephone ]
+
+  - [ mkdir, -p, /opt/quakespasm-server, /opt/quake2-server, /opt/quake3-server, /opt/half-life-server, /opt/alephone-server ]
+
+final_message: "retro-games base ready after $UPTIME seconds. No games installed yet."

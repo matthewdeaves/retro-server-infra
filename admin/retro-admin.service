@@ -1,0 +1,47 @@
+[Unit]
+Description=Retro game server admin UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=retroadmin
+Group=retroadmin
+ExecStart=/usr/bin/python3 /opt/retro-admin/retro-admin.py
+# Quake II's mode file. ProtectSystem=strict makes the whole hierarchy
+# read-only inside this unit's mount namespace, and sudo does NOT escape a
+# namespace — so without this, writing it fails with EROFS even as root.
+# Scoped to the one file, not the content directory around it.
+ReadWritePaths=/opt/quake2-server/baseq2/mode.cfg
+
+# Grant bookkeeping (who opened which address, and when) lives here.
+StateDirectory=retro-admin
+StateDirectoryMode=0750
+# Needed to read its own journal for the activity log.
+SupplementaryGroups=systemd-journal
+Restart=on-failure
+RestartSec=5s
+Environment=RETRO_ALLOW_TTL=12h
+# Everything deployment-specific (your domain, your Cloudflare team, your
+# admin addresses) lives outside git in this file, not inline here — see
+# admin/retro-admin.env.example for the required keys. Keep RETRO_ADMIN_EMAILS
+# here in step with admin_emails in terraform/cloudflare/terraform.tfvars.
+EnvironmentFile=/etc/retro-admin/admin.env
+
+# Binds 127.0.0.1:8080 only. Reachable exclusively via the Cloudflare tunnel,
+# which dials out — there is no inbound listener for this anywhere.
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictRealtime=true
+LockPersonality=true
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

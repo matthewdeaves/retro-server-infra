@@ -1,0 +1,59 @@
+# The admin UI needs exactly four powers and no others. Anything wider would
+# make a bug in a 200-line Python file equivalent to root on the box.
+#
+# Installed to /etc/sudoers.d/retro-admin, mode 0440.
+
+# Read the three allowlists, and edit the two that are meant to be dynamic.
+# `admins` is readable but deliberately NOT writable here. It is normally
+# empty — nothing gets permanent SSH, because a permanent entry is an address
+# you may stop owning when your ISP renumbers you. Grants go into admins_dyn
+# with a timeout instead. Keeping `admins` out of the web app's reach means a
+# bug here cannot create a permanent hole either.
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter players
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter admins
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter admins_dyn
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft add element inet filter players *
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft delete element inet filter players *
+# The v6 half of the same set. your admin hostname has AAAA records, so a
+# phone on a v6-first mobile network reaches the admin page over IPv6 and
+# arrives with a v6 address — which "Let me in" could not grant, and refused
+# with "Could not read your address".
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter players6
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft add element inet filter players6 *
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft delete element inet filter players6 *
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft add element inet filter admins_dyn *
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft delete element inet filter admins_dyn *
+
+# Quake II's mode file. Its coop/deathmatch cvars are latched and only read at
+# startup, so the mode is written here and applied by restarting the unit.
+retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /opt/quake2-server/baseq2/mode.cfg
+
+# Write to the game console FIFOs. `tee` rather than a shell redirect, because
+# the FIFOs are 0600 and owned by the individual game users.
+retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /run/quakespasm-server/console
+retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /run/quake2-server/console
+retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /run/quake3-server/console
+retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /run/half-life-server/console
+retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /run/alephone-server/console
+
+# Restart, start and stop the game units by name. Not `systemctl *`.
+#
+# `stop` was added for #9 under It is narrower than the
+# `restart` already here -- restart can do everything stop can and then brings
+# the unit back -- and the ADR's condition is that the UI records who stopped
+# a server, so a parked server never reads like one that died.
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart quakespasm-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart q2ded
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart ioq3ded
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart xash-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart alephone-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl start quakespasm-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl start q2ded
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl start ioq3ded
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl start xash-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl start alephone-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl stop quakespasm-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl stop q2ded
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl stop ioq3ded
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl stop xash-server
+retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl stop alephone-server

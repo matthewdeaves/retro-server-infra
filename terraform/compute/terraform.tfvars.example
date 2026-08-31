@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+
+# From the Oracle Cloud console: profile icon -> Tenancy -> OCID.
+tenancy_ocid = ""
+
+# Where the £0 budget tripwire emails if anything ever accrues cost.
+budget_alert_email = ""
+
+# Defaults are the SAFE half of the Always Free ARM allowance (1 OCPU / 6 GB).
+# Do not raise these without reading .claude/rules/oracle-constraints.md first
+# -- the full allowance leaves no margin, and any resize destroys the box.
+# ocpus     = 1
+# memory_gb = 6
