@@ -34,6 +34,18 @@
           body: 'ip=' + encodeURIComponent(ip),
         });
       })
+      .then((r) => (r && r.ok ? r.json() : null))
+      .then((d) => {
+        // A refused relay address is the one outcome the person has to be
+        // told about: nothing else on the page would ever mention it, and
+        // the pill will keep saying "can play" for the relay address while
+        // their game sits there timing out. #you-warn is already the slot
+        // for "you are not actually getting in", so it says so here too.
+        if (d && d.relay && d.advice) {
+          const w = $('you-warn');
+          if (w) w.textContent = d.advice;
+        }
+      })
       // Best-effort. api4.ipify.org being unreachable, or this browser
       // having no real IPv4 path either, both mean the same thing: nothing
       // to grant, quietly leave the existing IPv6-only state as it is.
