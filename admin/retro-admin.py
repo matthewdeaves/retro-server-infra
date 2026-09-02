@@ -3582,7 +3582,15 @@ def short_addr(addr):
 
 
 def access_card(ip, allowed, ua=""):
-    return ("<div class='card wide'><h2>Your access to the games</h2>"
+    # The games are not behind Cloudflare, so an IPv6 visitor's grant here
+    # never reaches them -- see post_allow_ipv4. The marker tells live.js
+    # whether it is worth asking api4.ipify.org at all; an IPv4 visitor
+    # needs no second address and gets no extra request.
+    try:
+        probe = " data-probe-v4=1" if ipaddress.ip_address(ip).version == 6 else ""
+    except ValueError:
+        probe = ""
+    return ("<div class='card wide'%s><h2>Your access to the games</h2>"
             "<div class=me><span class=big>%s</span>"
             "<span class='pill %s' id=you-pill>%s</span>"
             "<span class=ttl id=you-ttl></span></div>"
@@ -3597,7 +3605,8 @@ def access_card(ip, allowed, ua=""):
             # /api/status already warns about at :3770.
             "<p class=access-warn id=you-warn></p>"
             "</div>"
-            % (html.escape(device_label(ua)),
+            % (probe,
+               html.escape(device_label(ua)),
                "on" if allowed else "off",
                "can play" if allowed else "blocked",
                html.escape(ip),
@@ -4247,7 +4256,15 @@ class Handler(BaseHTTPRequestHandler):
                          # cover. Adding a hash here would also make the browser
                          # ignore 'unsafe-inline' and drop those attributes.
                          # Inline CSS cannot execute; inline script can.
-                         "script-src %s; connect-src 'self'; "
+                         # api4.ipify.org: the one external call this page
+                         # ever makes, and only when the visitor reached us
+                         # over IPv6. It has no AAAA record of its own, so a
+                         # successful reply proves the visitor's IPv4
+                         # actually works -- that address is what the game
+                         # servers need and Cloudflare never sees, since the
+                         # games are not proxied. See live.js.
+                         "script-src %s; "
+                         "connect-src 'self' https://api4.ipify.org; "
                          "form-action 'self'; frame-ancestors 'none'" % SCRIPT_SRC)
         self.end_headers()
         self.wfile.write(b)
@@ -4583,7 +4600,8 @@ class Handler(BaseHTTPRequestHandler):
     # The second table is the routes that act on one game. They all need the
     # same four things resolved and checked first, so that happens once here
     # rather than at the top of each one.
-    POST_ROUTES = {"/allow": "post_allow", "/revoke": "post_revoke",
+    POST_ROUTES = {"/allow": "post_allow", "/allow-ipv4": "post_allow_ipv4",
+                   "/revoke": "post_revoke",
                    "/subscribe": "post_subscribe",
                    "/unsubscribe": "post_unsubscribe"}
     GAME_POST_ROUTES = {"/mode": "post_mode", "/map": "post_map",
@@ -4694,6 +4712,52 @@ class Handler(BaseHTTPRequestHandler):
         record_grant(ip, who)
         self.log_message("ALLOW %s by %s ttl=%s", ip, who, ALLOW_TTL)
         return self._redirect("%s can reach the games and SSH for %s." % (ip, ALLOW_TTL))
+
+    def post_allow_ipv4(self, form, who):
+        """Grant an IPv4 address the browser found for itself, in the
+        background, after post_allow only had an IPv6 address to give it.
+
+        live.js sends this: when the page loads over IPv6, it asks
+        api4.ipify.org (no AAAA record of its own) what address that request
+        used, and if one comes back it is real — the games are not behind
+        Cloudflare, so this is the one way to learn the address they will
+        actually see, since a single connection only ever carries one family.
+
+        Trust here is weaker than post_allow's, which reads
+        CF-Connecting-IP: a network fact, not something a page reports about
+        itself. Bounded two ways to keep that acceptable: this route needs
+        the same Cloudflare Access session as every other control on the
+        site (only the two named admin emails ever reach it), and unlike
+        post_allow it never touches admins_dyn — a discovered address can
+        only ever open the game ports, never SSH."""
+        raw = field(form, "ip") or ""
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            self.log_message("DENIED POST /allow-ipv4: not an address: %r", raw)
+            return self._send(400, "bad address", "text/plain; charset=utf-8")
+        # is_global alone lets 224.0.0.1 through -- IANA counts multicast
+        # space as "global" too, which is true for allocation purposes and
+        # useless here: no real client ever connects FROM a multicast
+        # address, so it can only be a mistake or a malformed report.
+        if (not isinstance(addr, ipaddress.IPv4Address) or not addr.is_global
+                or addr.is_multicast):
+            self.log_message("DENIED POST /allow-ipv4: not a public IPv4: %s", raw)
+            return self._send(400, "not a public IPv4 address", "text/plain; charset=utf-8")
+        ip = str(addr)
+        ok, err = nft_delete("players", ip)
+        if not ok:
+            self.log_message("ALLOW4-DISCOVERED FAILED %s by %s: %s", ip, who, err)
+            return self._send(500, "could not update the firewall", "text/plain; charset=utf-8")
+        r = run(["sudo", "nft", "add", "element", "inet", "filter", "players",
+                 "{ %s timeout %s }" % (ip, ALLOW_TTL)])
+        if r.returncode:
+            self.log_message("ALLOW4-DISCOVERED FAILED %s by %s: %s", ip, who, r.stderr.strip())
+            return self._send(500, "could not update the firewall", "text/plain; charset=utf-8")
+        record_grant(ip, who)
+        self.log_message("ALLOW4-DISCOVERED %s by %s ttl=%s", ip, who, ALLOW_TTL)
+        return self._send(200, json.dumps({"ok": True, "ip": ip}),
+                          "application/json; charset=utf-8")
 
     def post_subscribe(self, form, who):
         """A browser asking to be told when a server falls over.

@@ -11,6 +11,35 @@
   let expiresAt = null;               // epoch ms your game access runs out
   let failures = 0;
 
+  // The games are not behind Cloudflare, so a grant made from an IPv6 visit
+  // (post_allow, the Allow button) never reaches them -- see
+  // post_allow_ipv4 for the full reasoning. [data-probe-v4] only exists in
+  // the markup when the server saw this visit arrive over IPv6, so an IPv4
+  // visitor never makes this request at all. api4.ipify.org has no AAAA
+  // record of its own, so a reply proves this browser's IPv4 genuinely
+  // works, and reports what it is -- the one thing this page cannot learn
+  // any other way, since a single connection only ever carries one address
+  // family. Runs once per page load, not on the 8s poll: the address does
+  // not change every few seconds, and post_allow_ipv4 already resets the
+  // timeout on every call, so nothing is lost by only doing this once.
+  if (document.querySelector('[data-probe-v4]')) {
+    fetch('https://api4.ipify.org', { mode: 'cors' })
+      .then((r) => (r.ok ? r.text() : null))
+      .then((ip) => {
+        ip = (ip || '').trim();
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return;
+        return fetch('/allow-ipv4', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'ip=' + encodeURIComponent(ip),
+        });
+      })
+      // Best-effort. api4.ipify.org being unreachable, or this browser
+      // having no real IPv4 path either, both mean the same thing: nothing
+      // to grant, quietly leave the existing IPv6-only state as it is.
+      .catch(() => {});
+  }
+
   function fmt(s) {
     if (s == null) return '';
     if (s <= 0) return 'expired';
