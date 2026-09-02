@@ -248,6 +248,23 @@ GAMES = {
     },
 }
 
+# Download-only entries: a client that has no dedicated server on this box at
+# all, so none of the GAMES machinery applies (no unit, no port, no fifo, no
+# nftables rule, no live status poll) -- just a tile on the downloads list.
+# KeeperFX is a personal client-only fork (see the keeperfx repo's own
+# README); there is no server-* release for it to deploy, so it can never
+# join GAMES the way the five dedicated servers do. Kept separate rather than
+# padding GAMES with keys that would silently mean nothing everywhere else
+# GAMES is read (health checks, nav, mode/settings panels, ...).
+DOWNLOAD_EXTRAS = {
+    "keeperfx": {
+        "label": "KeeperFX", "repo": "keeperfx",
+        # Only repo here without a .dmg client release -- ships a self-
+        # contained KeeperFX.app zipped instead.
+        "asset_exts": (".zip",),
+    },
+}
+
 # Which maps suit which mode. Campaign maps in a deathmatch list are noise, and
 # deathmatch maps in a co-op list have no monsters in them.
 MAP_RULES = {
@@ -995,7 +1012,7 @@ _ICON_CACHE = {}
 # file an image comes from, or how it is processed, has to change the cache
 # name too — otherwise the old picture survives the deploy and the change
 # looks like it silently did nothing. Bump this whenever either changes.
-ART_REV = 8
+ART_REV = 9
 
 # Letterbox colour behind a level picture that is not 4:3. Matches the card
 # background in the stylesheet.
@@ -3590,8 +3607,12 @@ _RELEASE_TTL = 1800          # half an hour; releases are cut by hand, rarely
 _RELEASE_LOCK = threading.Lock()
 
 
-def _fetch_release(repo):
-    """Latest CLIENT release for a repo, or None. Never raises."""
+def _fetch_release(repo, asset_exts=(".dmg",)):
+    """Latest CLIENT release for a repo, or None. Never raises.
+
+    `asset_exts` is a tuple because it is matched with str.endswith(), which
+    only accepts a tuple, not a list. Every game ships a .dmg; keeperfx has no
+    macOS installer convention of its own yet and ships KeeperFX.app zipped."""
     import urllib.request
     url = "https://api.github.com/repos/matthewdeaves/%s/releases?per_page=20" % repo
     req = urllib.request.Request(url, headers={
@@ -3612,7 +3633,7 @@ def _fetch_release(repo):
         if tag.startswith("server-"):
             continue          # the Linux server series, not what a player wants
         assets = [a for a in rel.get("assets") or []
-                  if (a.get("name") or "").lower().endswith(".dmg")]
+                  if (a.get("name") or "").lower().endswith(asset_exts)]
         return {
             "tag": tag,
             "url": rel.get("html_url") or "",
@@ -3646,8 +3667,11 @@ def _save_releases(d):
         pass
 
 
-def latest_release(game):
+def latest_release(repo, asset_exts=(".dmg",)):
     """The newest client release, and the last one we saw if GitHub says no.
+
+    Takes the repo name directly rather than a GAMES key, so a download-only
+    entry with no GAMES row (DOWNLOAD_EXTRAS) can call this too.
 
     Unauthenticated GitHub allows 60 requests an hour PER IP, shared by
     everything on this box. It is easy to reach: four repos, and any other tool
@@ -3659,7 +3683,6 @@ def latest_release(game):
     So the last good answer is kept on disk and served whenever a lookup fails,
     for as long as it takes to succeed again. "Unavailable" now means only what
     it says: nothing has ever been fetched."""
-    repo = GAMES[game].get("repo")
     if not repo:
         return None
     now = time.time()
@@ -3674,7 +3697,7 @@ def latest_release(game):
                 _RELEASE_CACHE[k] = (0, v)
             hit = _RELEASE_CACHE.get(repo)
 
-    rel = _fetch_release(repo)
+    rel = _fetch_release(repo, asset_exts)
     stale = hit[1] if hit else None
     with _RELEASE_LOCK:
         if rel:
@@ -3688,10 +3711,14 @@ def latest_release(game):
 
 
 def render_downloads():
-    """One row per game: the current Mac build, and where to get it."""
+    """One row per game: the current Mac build, and where to get it.
+
+    Chains GAMES with DOWNLOAD_EXTRAS: same row shape (a build to download,
+    optionally game data beside it), the extras just have nothing behind them
+    on this box to poll or manage."""
     rows = []
-    for g, cfg in GAMES.items():
-        rel = latest_release(g)
+    for g, cfg in list(GAMES.items()) + list(DOWNLOAD_EXTRAS.items()):
+        rel = latest_release(cfg.get("repo"), cfg.get("asset_exts", (".dmg",)))
         if rel:
             size = (" &middot; %s" % human_bytes(rel["size"])) if rel.get("size") else ""
             if rel.get("asset_url"):
@@ -3756,6 +3783,7 @@ GAMEDATA_FILES = {
     "quake3":   "quake3-data.zip",
     "halflife": "half-life-data.zip",
     "alephone": "alephone-data.zip",
+    "keeperfx": "keeperfx-data.zip",
 }
 _SUMS_CACHE = {}
 
@@ -4371,7 +4399,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path.startswith("/emblem/"):
             g = u.path[len("/emblem/"):]
-            if not g.endswith(".png") or g[:-4] not in GAMES:
+            if not g.endswith(".png") or (g[:-4] not in GAMES and g[:-4] not in DOWNLOAD_EXTRAS):
                 return self._not_found()
             return self._send_image(emblem_png(g[:-4]), "image/png")
 
