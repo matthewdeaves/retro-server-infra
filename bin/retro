@@ -615,6 +615,7 @@ cmd_drift() {
   # loaded looks identical to one that is working.
   console_canary || bad=1
   allowlist_canary || bad=1
+  firewall_canary || bad=1
   engine_canary || bad=1
 
   echo
@@ -778,6 +779,79 @@ allowlist_canary() {
       echo "    unless your address is in a set that survives it." >&2
       return 1 ;;
   esac
+}
+
+# ------------------------------------------------- persisted firewall canary
+#
+# allowlist_canary above asks whether the FILE has picked up something it
+# should not (a saved grant). This asks the mirror-image question, which is
+# the one that actually bit: whether the RUNNING ruleset contains something
+# the file does not.
+#
+# `nft add rule` and `nft add set` change the running kernel only. Nothing
+# writes them back. nftables.service replays /etc/nftables.conf at every boot,
+# so anything added live and never persisted is silently gone the next time
+# the box restarts -- and it comes back as the feature quietly not working
+# rather than as an error, because every layer above it still reports success.
+#
+# Found on 2026-09-02: the `blocked` set and its `update @blocked` rule had
+# been added live, the admin UI read the set fine, the downloads and access
+# pages rendered fine, and a reboot would have taken the whole
+# blocked-attempts feature away without a word. Two `udp dport 4226` accepts
+# for Aleph One were in the same state, so a reboot would also have quietly
+# stopped Aleph One clients being able to join.
+#
+# Counts rather than diffs. The file is a template with comments and line
+# continuations and the kernel's dump is normalised, so matching them text
+# for text is fragile in a way that produces false alarms; the counts are
+# exact and a disagreement is always worth a human look.
+firewall_canary() {
+  local out fs ls fr lr bad=0
+  # Tagged output, and an explicit readability test first, for the same reason
+  # as allowlist_canary: grep -c prints 0 and exits 1 when it matches nothing,
+  # so an exit status cannot tell "clean" from "could not read the file".
+  out=$("${SSH[@]}" 'sudo test -r /etc/nftables.conf || exit 9
+    printf "FILESETS %s\n"  "$(sudo grep -cE "^[[:space:]]*set [a-z0-9_]+ \{" /etc/nftables.conf)"
+    printf "LIVESETS %s\n"  "$(sudo nft list table inet filter | grep -cE "^[[:space:]]*set [a-z0-9_]+ \{")"
+    printf "FILERULES %s\n" "$(sudo sed -n "/chain input {/,/^  }/p" /etc/nftables.conf \
+      | sed "s/#.*//" | grep -vE "^[[:space:]]*$" \
+      | grep -vE "chain input|type filter hook|^[[:space:]]*\}" \
+      | grep -vE "\\\\$" | wc -l)"
+    printf "LIVERULES %s\n" "$(sudo nft -a list chain inet filter input \
+      | grep -E "# handle [0-9]+$" | grep -vE "^[[:space:]]*chain " | wc -l)"' 2>/dev/null)
+
+  fs=$(printf '%s\n' "$out" | awk '/^FILESETS /  {print $2; exit}')
+  ls=$(printf '%s\n' "$out" | awk '/^LIVESETS /  {print $2; exit}')
+  fr=$(printf '%s\n' "$out" | awk '/^FILERULES / {print $2; exit}')
+  lr=$(printf '%s\n' "$out" | awk '/^LIVERULES / {print $2; exit}')
+
+  case "$fs$ls$fr$lr" in
+    ""|*[!0-9]*)
+      printf "  %-40s %s\n" "firewall persisted" "UNKNOWN"
+      echo "    could not read /etc/nftables.conf or the running ruleset, so it is" >&2
+      echo "    unproven whether the live firewall survives a reboot." >&2
+      return 1 ;;
+  esac
+
+  if [ "$ls" -ne "$fs" ] || [ "$lr" -ne "$fr" ]; then
+    printf "  %-40s %s\n" "firewall persisted" \
+      "DRIFTED (live $ls sets/$lr rules, file $fs/$fr)"
+    echo "    The running ruleset and /etc/nftables.conf disagree. nftables.service" >&2
+    echo "    replays that file at every boot, so anything live-only is lost the next" >&2
+    echo "    time this box restarts -- silently, as a feature that stops working" >&2
+    echo "    rather than as an error. Compare them with:" >&2
+    echo "      retro ssh 'sudo nft -a list chain inet filter input'" >&2
+    echo "      retro ssh 'sudo sed -n \"/chain input/,/^  }/p\" /etc/nftables.conf'" >&2
+    echo "    Fix by bringing the FILE up to what cloud-init.yaml now renders, not by" >&2
+    echo "    saving the live ruleset over it -- a saved ruleset bakes in live grants," >&2
+    echo "    which is the failure allowlist_canary exists to catch." >&2
+    echo "    Reloading drops every live grant, including your own SSH one in" >&2
+    echo "    admins_dyn, so do it deliberately and not while anyone is playing." >&2
+    bad=1
+  else
+    printf "  %-40s %s\n" "firewall persisted" "same ($ls sets, $lr rules)"
+  fi
+  return "$bad"
 }
 
 cmd_dropins() {
