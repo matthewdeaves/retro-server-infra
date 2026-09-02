@@ -1090,6 +1090,20 @@ footer code { font: .76rem var(--mono) }
 .dl-data:hover, .dl-data:focus-visible { background: var(--ui-soft) }
 .dl-none { flex: none; opacity: 0.5; font-size: 0.9rem; }
 
+/* Older/Newer for the Who played list -- quiet like .dl-data, since paging
+   through history is not the reason anyone opened this tab. */
+.pager {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: .75rem; padding-top: .75rem; border-top: 1px solid var(--line);
+}
+.pager a, .pager .disabled {
+  padding: 7px 13px; border-radius: 8px; font-weight: 600; font-size: 0.85rem;
+  text-decoration: none; border: 1px solid var(--edge); white-space: nowrap;
+}
+.pager a { color: var(--ui) }
+.pager a:hover, .pager a:focus-visible { background: var(--ui-soft) }
+.pager .disabled { color: var(--mut); opacity: 0.5; border-color: transparent }
+
 /* On a phone the action drops under the name rather than squeezing it. */
 @media (max-width: 560px) {
   .dl-row { flex-wrap: wrap; }

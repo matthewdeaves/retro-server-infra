@@ -147,7 +147,11 @@
     setHTML('players-list', s.players_list);
     setHTML('admins-list', s.admins_list);
     setHTML('activity', s.activity);
-    setHTML('played', s.played);
+    // s.played is always page 1 -- patching it while looking at an older page
+    // of history would silently swap what's on screen for something else
+    // every 8 seconds, so this only runs on page 1 (no ?page=, or page=1).
+    const playPage = new URLSearchParams(location.search).get('page');
+    if (!playPage || playPage === '1') setHTML('played', s.played);
     if (s.total_players != null) {
       const t = $('totalplayers');
       if (t) t.textContent = s.total_players === 0 ? 'nobody playing'

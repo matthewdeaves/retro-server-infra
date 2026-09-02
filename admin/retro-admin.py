@@ -608,15 +608,19 @@ def play_recover():
         _save_play(d)
 
 
-def play_sessions(n=20):
-    """Finished sessions, newest first, with anything still running on top."""
+def play_sessions(n=20, offset=0):
+    """Finished sessions, newest first, with anything still running on top.
+
+    Returns (rows, total) so a caller can page without a second pass over the
+    file — total is the full count behind the cap this page didn't ask for."""
     with _PLAY_LOCK:
         d = _load_play()
     live = [{"g": g, "a": c["a"], "b": c["b"], "peak": c.get("peak", 1),
              "names": c.get("names", []), "live": True}
             for g, c in d["open"].items()]
     live.sort(key=lambda s: s["a"], reverse=True)
-    return (live + d["done"][::-1])[:n]
+    rows = live + d["done"][::-1]
+    return rows[offset:offset + n], len(rows)
 
 
 # ------------------------------------------------------------------ Web Push
@@ -3442,15 +3446,30 @@ def _play_day(epoch):
     return time.strftime("%a %d %b", t)
 
 
-def play_html(n=20):
+PLAY_PAGE = 20        # rows per page of "Who played" -- also /api/status's page-1 refresh size
+
+
+def play_html(n=PLAY_PAGE, offset=0):
     """The answer to "did anyone play last night", as list items.
+
+    Only ever called with the default page-1 slice — /api/status's live poll
+    refreshes just that, on the theory that older pages are history and don't
+    need refreshing (live.js skips the poll patch once you've paged away from
+    page 1, so this staying page-1-only is not a bug, see live.js)."""
+    rows, _total = play_sessions(n, offset)
+    return _play_rows_html(rows, offset)
+
+
+def _play_rows_html(rows, offset=0):
+    """The <li> markup for one page of play_sessions() rows.
 
     Peak rather than final count, because a session that ends with one person
     still had three in it. Names are what the engine published during the
     session; Half-Life publishes none, and the line says so rather than
     leaving a blank that reads as nobody."""
-    rows = play_sessions(n)
     if not rows:
+        if offset:
+            return "<li class=none>Nothing on this page.</li>"
         return ("<li class=none>Nothing recorded yet. This begins at the first "
                 "join after it went up and cannot know about earlier "
                 "evenings.</li>")
@@ -3473,6 +3492,25 @@ def play_html(n=20):
                    "<span class=grantby>%s</span></li>"
                    % (html.escape(label), start, end, html.escape(note)))
     return "".join(out)
+
+
+def play_pager_html(page, total, per_page=PLAY_PAGE):
+    """Older/Newer for the Who played list, or nothing if it all fits on one
+    page. No page numbers to click \u2014 the list only grows one evening at a
+    time, so "is there more" matters more than "how many pages exist"."""
+    pages = max(1, -(-total // per_page))          # ceil division, no float
+    if pages <= 1:
+        return ""
+    if page > 1:
+        newer = "<a href='/activity?page=%d'>&larr; Newer</a>" % (page - 1)
+    else:
+        newer = "<span class=disabled>&larr; Newer</span>"
+    if page < pages:
+        older = "<a href='/activity?page=%d'>Older &rarr;</a>" % (page + 1)
+    else:
+        older = "<span class=disabled>Older &rarr;</span>"
+    return ("<div class=pager>%s<span class=ttl>page %d of %d</span>%s</div>"
+            % (newer, page, pages, older))
 
 
 REFRESH_JS = "<script>" + LIVE_JS + "</script>"
@@ -4037,13 +4075,22 @@ def page_access(ip, allowed, ua=""):
                render_access(admins, grants, True, "Nobody.")))
 
 
-def page_activity(ip, allowed):
+def page_activity(ip, allowed, page=1):
     events = activity_lines(40)
+    rows, total = play_sessions(PLAY_PAGE, (page - 1) * PLAY_PAGE)
+    # An out-of-range page (someone edited the URL, or the log shrank under
+    # them) still needs to show the nearest real page rather than "nothing on
+    # this page" for a page number that no longer exists.
+    pages = max(1, -(-total // PLAY_PAGE))
+    if page > pages:
+        page = pages
+        rows, total = play_sessions(PLAY_PAGE, (page - 1) * PLAY_PAGE)
     return ("<div class='card wide'><h2><span>Who played</span>"
-            "<span>last %d kept</span></h2><ul class=list id=played>%s</ul></div>"
+            "<span>%d recorded</span></h2><ul class=list id=played>%s</ul>%s</div>"
             "<div class='card wide'><h2>Recent admin activity</h2>"
             "<p class=log id=activity>%s</p></div>"
-            % (PLAY_MAX, play_html(),
+            % (total, _play_rows_html(rows, (page - 1) * PLAY_PAGE),
+               play_pager_html(page, total),
                html.escape("\n".join(events)) or "nothing yet"))
 
 
@@ -4507,9 +4554,13 @@ class Handler(BaseHTTPRequestHandler):
                                          page_access(ip, allowed, ua), "/access", who, flash,
                                          REFRESH_JS, players_line_text, hostline))
         if u.path == "/activity":
+            try:
+                page = max(1, int(q.get("page", ["1"])[0]))
+            except ValueError:
+                page = 1
             return self._send(200, shell("Activity", "Activity",
                                          "What has been done, and by whom.",
-                                         page_activity(ip, allowed), "/activity", who, flash,
+                                         page_activity(ip, allowed, page), "/activity", who, flash,
                                          REFRESH_JS, players_line_text, hostline))
         if u.path.startswith("/game/"):
             game = u.path[len("/game/"):].strip("/")
