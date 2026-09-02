@@ -31,6 +31,7 @@ carries none, and none of the four throttle joining. Those limiters are a
 second layer, not a replacement for this allowlist.
 """
 import base64
+import bisect
 import glob
 import hashlib
 import hmac
@@ -3654,6 +3655,120 @@ _RELEASE_TTL = 1800          # half an hour; releases are cut by hand, rarely
 _RELEASE_LOCK = threading.Lock()
 
 
+# ------------------------------------------------------- iCloud Private Relay
+#
+# Safari with Private Relay on does not reach this site from the machine you
+# are sitting at: it comes out of an Apple relay, and the address here is
+# Apple's egress, not yours. The games are not behind Cloudflare, so the game
+# client -- which Private Relay does not cover, it is Safari-only -- arrives
+# from your REAL address, which nothing here has ever seen. Granting the relay
+# therefore does nothing except put a shared CDN address in the games
+# allowlist, where it can only ever match strangers.
+#
+# Measured on 2026-09-02, a real evening lost to exactly this: three separate
+# grants for one person, 2a09:bac3:3770:23cd::391:82 (relay v6),
+# 140.248.40.25 (Fastly relay), 104.28.30.132 (Cloudflare relay), and the page
+# telling him each time that he was allowed in. His actual client was on
+# 77.97.144.64 the whole time. It only worked when he signed in with Chrome,
+# which Private Relay does not touch.
+#
+# Apple publishes the egress ranges, so this is detectable rather than
+# guessable. Verified against that file: all three relay addresses above are
+# in it, and both real home addresses are not.
+RELAY_CSV = "https://mask-api.icloud.com/egress-ip-ranges.csv"
+RELAY_FILE = os.path.join(STATE_DIR, "relay-ranges.json")
+_RELAY_TTL = 86400           # Apple edits this file slowly; once a day is plenty
+_RELAY_LOCK = threading.Lock()
+_RELAY_CACHE = {"at": 0, "v4": None}
+
+
+def _parse_relay_csv(text):
+    """IPv4 egress ranges as sorted (first, last) integer pairs.
+
+    IPv4 only, deliberately. The file is 12 MB and a quarter of a million v6
+    ranges; holding those costs real memory on a 6 GB box running five game
+    servers, and buys nothing -- an IPv6 grant is refused anyway, since the
+    games have no IPv6 address at all (see post_allow)."""
+    out = []
+    for line in text.splitlines():
+        cidr = line.split(",", 1)[0].strip()
+        if not cidr or ":" in cidr:
+            continue
+        try:
+            n = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if n.version == 4:
+            out.append((int(n.network_address), int(n.broadcast_address)))
+    out.sort()
+    return out
+
+
+def _relay_ranges():
+    """The cached v4 egress ranges, or None if they cannot be established.
+
+    None means "unknown", and every caller treats unknown as "not a relay" --
+    fail open. Apple being unreachable must never take the Allow button with
+    it; a wrong grant is recoverable in a way that being locked out of the
+    only mechanism for granting anything is not."""
+    now = time.time()
+    with _RELAY_LOCK:
+        if _RELAY_CACHE["v4"] is not None and now - _RELAY_CACHE["at"] < _RELAY_TTL:
+            return _RELAY_CACHE["v4"]
+    ranges = None
+    try:
+        import urllib.request
+        req = urllib.request.Request(RELAY_CSV, headers={"User-Agent": "retro-admin"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            ranges = _parse_relay_csv(r.read().decode("utf-8", "replace"))
+    except Exception:
+        ranges = None
+    if ranges:
+        with _RELAY_LOCK:
+            _RELAY_CACHE["at"], _RELAY_CACHE["v4"] = now, ranges
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = RELAY_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(ranges, f)
+            os.replace(tmp, RELAY_FILE)
+        except OSError:
+            pass
+        return ranges
+    # Fetch failed. Last good answer from disk beats no answer, and is still
+    # right: these ranges change slowly.
+    try:
+        with open(RELAY_FILE) as f:
+            ranges = [tuple(p) for p in json.load(f)]
+    except (OSError, ValueError):
+        return None
+    with _RELAY_LOCK:
+        _RELAY_CACHE["at"], _RELAY_CACHE["v4"] = now - _RELAY_TTL + 300, ranges
+    return ranges
+
+
+def is_relay_address(ip):
+    """True if `ip` is an iCloud Private Relay egress. Unknown counts as False."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.version != 4:
+        return False
+    ranges = _relay_ranges()
+    if not ranges:
+        return False
+    n = int(addr)
+    i = bisect.bisect_right(ranges, (n, float("inf")))
+    return i > 0 and ranges[i - 1][0] <= n <= ranges[i - 1][1]
+
+
+RELAY_ADVICE = ("That is an iCloud Private Relay address, not this machine's. "
+                "The games never see it, so allowing it cannot let you in. "
+                "Turn Private Relay off (Settings, Apple Account, iCloud, "
+                "Private Relay) or use another browser, then press Allow again.")
+
+
 def _fetch_release(repo, asset_exts=(".dmg",)):
     """Latest CLIENT release for a repo, or None. Never raises.
 
@@ -4697,6 +4812,13 @@ class Handler(BaseHTTPRequestHandler):
                 "network, reload this page, and press Allow again to "
                 "grant your real IPv4 address." % ip, ok=False)
 
+        # Refuse rather than grant: a relay address in `players` is a shared
+        # CDN address that can only ever match strangers, and the person in
+        # front of it still cannot join. Saying so is the useful answer.
+        if is_relay_address(ip):
+            self.log_message("ALLOW REFUSED %s by %s: iCloud Private Relay", ip, who)
+            return self._redirect("%s — %s" % (ip, RELAY_ADVICE), ok=False)
+
         for setname in ("players", "admins_dyn"):
             ok, err = nft_delete(setname, ip)
             if not ok:
@@ -4745,6 +4867,17 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("DENIED POST /allow-ipv4: not a public IPv4: %s", raw)
             return self._send(400, "not a public IPv4 address", "text/plain; charset=utf-8")
         ip = str(addr)
+        # api4.ipify.org answers the RELAY when Private Relay is on, so this
+        # path is the most likely place to discover one. Refusing keeps the
+        # allowlist clean; the JSON says why so live.js can put it on screen,
+        # which is the only way the person finds out -- nothing else about
+        # this request is visible to them.
+        if is_relay_address(ip):
+            self.log_message("ALLOW4-DISCOVERED REFUSED %s by %s: iCloud Private Relay",
+                             ip, who)
+            return self._send(200, json.dumps({"ok": False, "relay": True,
+                                               "ip": ip, "advice": RELAY_ADVICE}),
+                              "application/json; charset=utf-8")
         ok, err = nft_delete("players", ip)
         if not ok:
             self.log_message("ALLOW4-DISCOVERED FAILED %s by %s: %s", ip, who, err)
