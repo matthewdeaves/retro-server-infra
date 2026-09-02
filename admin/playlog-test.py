@@ -54,7 +54,8 @@ def sample(t, **games):
     ra.play_sample(now=t)
 
 def sessions():
-    return ra.play_sessions(50)
+    rows, _total = ra.play_sessions(50)
+    return rows
 
 fails = []
 def want(label, got, expected):
