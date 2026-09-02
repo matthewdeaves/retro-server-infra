@@ -19,6 +19,10 @@ retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft delete element inet filter players
 # arrives with a v6 address — which "Let me in" could not grant, and refused
 # with "Could not read your address".
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter players6
+# Read-only. The games' own view of who tried to reach them and was refused,
+# which is the only address a relayed browser can never tell us -- see
+# blocked_attempts().
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter blocked
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft add element inet filter players6 *
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft delete element inet filter players6 *
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft add element inet filter admins_dyn *

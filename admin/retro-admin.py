@@ -3763,6 +3763,65 @@ def is_relay_address(ip):
     return i > 0 and ranges[i - 1][0] <= n <= ranges[i - 1][1]
 
 
+# The set nftables drops game-port packets into, so the page can offer the one
+# address that matters. Timeout must match the `timeout` on the set itself, or
+# "tried N ago" is wrong -- nft reports time REMAINING, not time elapsed.
+BLOCKED_TTL = 900            # 15m, matching `nft add set ... timeout 15m`
+
+
+def blocked_attempts():
+    """Who tried to reach a game just now and was refused, newest first.
+
+    This is the answer to the relay problem rather than a report on it. A
+    browser behind iCloud Private Relay can only ever tell us Apple's egress
+    address; the game client is not relayed, so when it knocks on a game port
+    the box sees the real machine. Refused packets are recorded here by
+    nftables, which makes the address knowable from the games' own side --
+    the one place it was never in doubt.
+
+    Scanners hit these ports constantly, so this is deliberately short-lived
+    (BLOCKED_TTL) and shown newest first: the entry a person cares about is
+    the one from ten seconds ago, not the noise from ten minutes ago."""
+    out = []
+    for addr, expires in set_members("blocked"):
+        try:
+            ago = BLOCKED_TTL - int(expires) if expires is not None else None
+        except (TypeError, ValueError):
+            ago = None
+        out.append((str(addr), ago))
+    # Smallest "ago" is the most recent. Unknown ages sort last.
+    out.sort(key=lambda r: (r[1] is None, r[1] if r[1] is not None else 0))
+    return out
+
+
+def render_blocked(rows, allowed_now):
+    """The blocked list, with a way to let each one in."""
+    if not rows:
+        return ""
+    items = []
+    for ip, ago in rows:
+        if ip in allowed_now:
+            continue          # already in; showing it would just be confusing
+        when = ("%ds ago" % ago if ago is not None and ago < 60
+                else "%dm ago" % (ago // 60) if ago is not None
+                else "recently")
+        items.append(
+            "<li><code>%s</code><span class=ttl>%s</span>"
+            "<form method=post action=/allow-blocked>"
+            "<input type=hidden name=ip value='%s'>"
+            "<button class='tiny primaryish' type=submit>Let this one in</button>"
+            "</form></li>" % (html.escape(ip), when, html.escape(ip)))
+    if not items:
+        return ""
+    return ("<div class='card wide'><h2><span>Tried to play and was blocked</span>"
+            "<span>last %d min</span></h2>"
+            "<p class=hint>These are addresses the games themselves saw. If you "
+            "are trying to get someone in and the button above granted the wrong "
+            "address — a relay, a VPN — this is the real one.</p>"
+            "<ul class=list>%s</ul></div>"
+            % (BLOCKED_TTL // 60, "".join(items)))
+
+
 RELAY_ADVICE = ("That is an iCloud Private Relay address, not this machine's. "
                 "The games never see it, so allowing it cannot let you in. "
                 "Turn Private Relay off (Settings, Apple Account, iCloud, "
@@ -4188,6 +4247,8 @@ def page_access(ip, allowed, ua=""):
     admins = set_members("admins") + set_members("admins_dyn")
     grants = _load_grants()
     return (access_card(ip, allowed, ua)
+            + render_blocked(blocked_attempts(),
+                             {str(a) for a, _ in players})
             + notify_card()
             + "<div class=card><h2><span>Can play right now</span><span>%s window</span></h2>"
               "<ul class=list>%s</ul></div>"
@@ -4716,6 +4777,7 @@ class Handler(BaseHTTPRequestHandler):
     # same four things resolved and checked first, so that happens once here
     # rather than at the top of each one.
     POST_ROUTES = {"/allow": "post_allow", "/allow-ipv4": "post_allow_ipv4",
+                   "/allow-blocked": "post_allow_blocked",
                    "/revoke": "post_revoke",
                    "/subscribe": "post_subscribe",
                    "/unsubscribe": "post_unsubscribe"}
@@ -4891,6 +4953,45 @@ class Handler(BaseHTTPRequestHandler):
         self.log_message("ALLOW4-DISCOVERED %s by %s ttl=%s", ip, who, ALLOW_TTL)
         return self._send(200, json.dumps({"ok": True, "ip": ip}),
                           "application/json; charset=utf-8")
+
+    def post_allow_blocked(self, form, who):
+        """Let in an address the games themselves saw being refused.
+
+        The address comes from the page, but unlike post_allow_ipv4 it is not
+        taken on trust: it is only accepted if it is in the `blocked` set
+        right now, which nftables put there because that address actually
+        sent a packet at a game port in the last BLOCKED_TTL. So the thing
+        being vouched for is a fact the kernel recorded, not a claim the
+        browser made -- you cannot use this to open a port for an address
+        that never knocked.
+
+        Games only, never admins_dyn: knocking on a game port says nothing
+        about whether someone should reach SSH."""
+        raw = field(form, "ip") or ""
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return self._redirect("Not a valid address.", ok=False)
+        ip = str(addr)
+        if ip not in {str(a) for a, _ in set_members("blocked")}:
+            # Expired while the page sat open, or never there at all.
+            self.log_message("DENIED POST /allow-blocked %s by %s: not blocked", ip, who)
+            return self._redirect(
+                "%s is not in the blocked list any more — reload and try again, or "
+                "have them attempt to join once more." % ip, ok=False)
+        ok, err = nft_delete("players", ip)
+        if not ok:
+            self.log_message("ALLOW-BLOCKED FAILED %s by %s: %s", ip, who, err)
+            return self._redirect("Could not update the firewall.", ok=False)
+        r = run(["sudo", "nft", "add", "element", "inet", "filter", "players",
+                 "{ %s timeout %s }" % (ip, ALLOW_TTL)])
+        if r.returncode:
+            self.log_message("ALLOW-BLOCKED FAILED %s by %s: %s", ip, who, r.stderr.strip())
+            return self._redirect("Could not update the firewall.", ok=False)
+        record_grant(ip, who)
+        self.log_message("ALLOW-BLOCKED %s by %s ttl=%s", ip, who, ALLOW_TTL)
+        return self._redirect("%s can reach the games for %s. Tell them to try "
+                              "joining again now." % (ip, ALLOW_TTL))
 
     def post_subscribe(self, form, who):
         """A browser asking to be told when a server falls over.
