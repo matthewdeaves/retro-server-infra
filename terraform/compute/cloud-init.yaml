@@ -50,8 +50,8 @@ write_files:
         # residential connections that renumber, so a permanent entry is an
         # address you may not own any more. Access is granted through the admin
         # UI, which writes into admins_dyn with a timeout, and the genuine
-        # break-glass is Oracle's serial console , which
-        # needs no firewall rule at all.
+        # break-glass is Oracle's serial console, which needs no firewall
+        # rule at all.
         set admins {
           type ipv4_addr
           flags interval
