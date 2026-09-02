@@ -4650,6 +4650,17 @@ class Handler(BaseHTTPRequestHandler):
         # the one button that matters for anyone on a mobile network that
         # is IPv6-first — the admin hostname has AAAA records, so that is
         # not a corner case.
+        #
+        # But granting it here does not mean it works: confirmed live
+        # 2026-09-02 that the box has no public IPv6 address at all (`ip -6
+        # addr show scope global` is empty) and games/g.matthewdeaves.com
+        # carry no AAAA record — the game ports are IPv4-only end to end,
+        # regardless of what nftables says. A v6 grant can never be
+        # followed by a working game connection, so the message must not
+        # imply it can — it only used to say "you'll need its own grant",
+        # which reads as "also do this" rather than "this path is a dead
+        # end". Real case: a v6-only grant here, and no working connection
+        # until the same person re-visited on IPv4.
         if family == 6:
             ok, err = nft_delete("players6", ip)
             if not ok:
@@ -4663,10 +4674,10 @@ class Handler(BaseHTTPRequestHandler):
             record_grant(ip, who)
             self.log_message("ALLOW6 %s by %s ttl=%s", ip, who, ALLOW_TTL)
             return self._redirect(
-                "%s can reach the games over IPv6 for %s. You reached this page "
-                "over IPv6, so that is the only address known — the game servers "
-                "also answer on IPv4, and a client connecting that way will need "
-                "its own grant." % (ip, ALLOW_TTL))
+                "%s recorded, but that won't get you in: the game servers "
+                "only have an IPv4 address. Turn IPv6 off for this "
+                "network, reload this page, and press Allow again to "
+                "grant your real IPv4 address." % ip, ok=False)
 
         for setname in ("players", "admins_dyn"):
             ok, err = nft_delete(setname, ip)
