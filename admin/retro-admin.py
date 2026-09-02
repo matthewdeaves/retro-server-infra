@@ -314,8 +314,34 @@ def field(form, name, default=""):
     return (form.get(name) or [default])[0]
 
 
+# ------------------------------------------------------ the nftables snapshot
+#
+# Held here, above run(), only so run() can invalidate it without a forward
+# reference. _all_sets() further down is what fills it.
+_SETS_TTL = 1.0
+_SETS_LOCK = threading.Lock()
+_sets_cache = {"at": 0.0, "sets": None}
+
+
+def _sets_invalidate():
+    with _SETS_LOCK:
+        _sets_cache["at"], _sets_cache["sets"] = 0.0, None
+
+
 def run(args, stdin=None, timeout=15):
-    return subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout)
+    # Centralised on purpose. Grants are written from four different places
+    # (post_allow's v4 and v6 branches, post_allow_ipv4, post_allow_blocked)
+    # and revoked from a fifth, and every one of them reads a set back
+    # afterwards to prove the write landed -- which is the whole point of the
+    # delete-then-add dance, since a bare `add` on an existing element exits 0
+    # and changes no timeout. A read-back answered from a snapshot taken
+    # before the write would confirm the wrong thing and look identical to
+    # working. Invalidating here means a new grant path cannot forget to.
+    if len(args) > 2 and args[0] == "sudo" and args[1] == "nft" \
+            and args[2] in ("add", "delete", "flush", "replace"):
+        _sets_invalidate()
+    return r
 
 
 def verify_access(token):
@@ -2413,24 +2439,72 @@ def life_html(game, unit, state):
     return ("up %s" % html.escape(up)) if up else ""
 
 
+def _all_sets():
+    """Every named set in the table, from ONE nft call.
+
+    This used to be one `sudo nft -j list set ...` per set. A single
+    /api/status asks for five and repeats two of them -- six sudo processes,
+    each opening and closing a PAM session, every eight seconds, for every
+    open tab. Two things came of that, and neither looked like a caching
+    problem from the outside:
+
+      * 74,000 journal lines a day from this one service, more than everything
+        else on the box combined, which is what the 2026-09-02 OOM was hiding
+        in.
+      * the OOM itself. The kernel trace names `systemctl invoked oom-killer`
+        inside this cgroup with python3 as the victim -- forking from a
+        process already near MemoryMax is what tips it over, and this was by
+        far the largest source of forks.
+
+    Held for a moment so the several lookups inside one page render share a
+    single call, and thrown away by run() the instant anything writes. The
+    window is deliberately shorter than the 8s poll: it exists to collapse
+    duplicates within one request, not to serve one request from another.
+
+    A failed call caches an empty dict for that moment, so every set reads
+    empty and every allowed-check says no. That is the same fail-closed answer
+    the per-set version gave when nft failed, and it is the right way round:
+    a firewall we cannot read is not one we should assume let someone in."""
+    with _SETS_LOCK:
+        if _sets_cache["sets"] is not None \
+                and time.monotonic() - _sets_cache["at"] < _SETS_TTL:
+            return _sets_cache["sets"]
+    # `list sets inet`, not `list table inet filter`. Both return every set
+    # with its elements in one call; only the second also hands this process
+    # the whole rule chain, which it has no use for. Same saving, nothing
+    # widened -- the sudoers grant stays as narrow in what it reveals as the
+    # five per-set reads it replaces.
+    out = run(["sudo", "nft", "-j", "list", "sets", "inet"])
+    sets = {}
+    if out.returncode == 0:
+        try:
+            for obj in json.loads(out.stdout).get("nftables", []):
+                s = obj.get("set")
+                if not isinstance(s, dict) or "name" not in s:
+                    continue
+                # Family-wide, so scope it back to our table by hand.
+                if s.get("table") != "filter":
+                    continue
+                found = []
+                for e in s.get("elem", []):
+                    if isinstance(e, dict) and "elem" in e:
+                        found.append((e["elem"]["val"], e["elem"].get("expires")))
+                    else:
+                        found.append((e, None))
+                sets[s["name"]] = found
+        except (ValueError, KeyError, TypeError):
+            sets = {}
+    with _SETS_LOCK:
+        _sets_cache["at"], _sets_cache["sets"] = time.monotonic(), sets
+    return sets
+
+
 def set_members(name):
-    out = run(["sudo", "nft", "-j", "list", "set", "inet", "filter", name])
-    if out.returncode != 0:
-        return []
-    try:
-        for obj in json.loads(out.stdout).get("nftables", []):
-            if "set" not in obj:
-                continue
-            found = []
-            for e in obj["set"].get("elem", []):
-                if isinstance(e, dict) and "elem" in e:
-                    found.append((e["elem"]["val"], e["elem"].get("expires")))
-                else:
-                    found.append((e, None))
-            return found
-    except (ValueError, KeyError, TypeError):
-        pass
-    return []
+    # A set that does not exist reads as empty, exactly as it did when this
+    # shelled out per set and nft exited non-zero for the missing name. That
+    # matters for `blocked`, which lives only in the running ruleset on a box
+    # whose /etc/nftables.conf predates it -- see firewall_canary in bin/retro.
+    return _all_sets().get(name, [])
 
 
 def human_secs(s):
@@ -5366,6 +5440,35 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect("%s started." % cfg["label"], to=back)
         self.log_message("RESTART %s by %s", cfg["unit"], who)
         return self._redirect("%s restarted. Everyone was disconnected." % cfg["label"], to=back)
+
+    # Paths that say nothing when they succeed. The 8s poll alone is ~10,800
+    # lines a day per open tab, and every page load re-fetches a dozen icons.
+    _QUIET = ("/api/status", "/icon/", "/emblem/", "/shot/", "/healthz",
+              "/app.css", "/app.js", "/live.js", "/sw.js", "/pwa/")
+
+    def log_request(self, code="-", size="-"):
+        """Log the requests that mean something, and the failures of the ones
+        that do not.
+
+        This service wrote 74,000 journal lines a day, more than everything
+        else on the box combined, almost none of it about anything anyone did.
+        That is not merely untidy: on 2026-09-02 it is what an OOM kill of
+        this very service sat unnoticed inside.
+
+        Only successful fetches of the paths above are dropped. A 403, a 404
+        or a 500 on any of them still gets a line -- an icon that stopped
+        resolving or a poll that started failing is exactly the kind of thing
+        this log is for. Everything else, /gamedata downloads and every POST
+        included, is logged as before, and the explicit audit calls
+        (ALLOW, ALLOW6, DENIED, REVOKE...) go through log_message and are not
+        touched by this at all."""
+        try:
+            c = int(code)
+        except (TypeError, ValueError):
+            c = 0
+        if 200 <= c < 400 and self.path.split("?")[0].startswith(self._QUIET):
+            return
+        super().log_request(code, size)
 
     def log_message(self, fmt, *args):
         # journald picks this up; it is the audit trail of who did what.

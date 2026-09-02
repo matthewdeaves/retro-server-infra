@@ -9,6 +9,18 @@
 # you may stop owning when your ISP renumbers you. Grants go into admins_dyn
 # with a timeout instead. Keeping `admins` out of the web app's reach means a
 # bug here cannot create a permanent hole either.
+# One read for every set, replacing the five per-set reads that used to live
+# here. /api/status asked for five sets and repeated two of them, so each
+# eight-second poll from each open tab forked six sudo processes and opened
+# and closed six PAM sessions. That produced 74,000 journal lines a day, and
+# the forking is what the 2026-09-02 OOM caught in the act: the kernel trace
+# names `systemctl invoked oom-killer` inside this service's cgroup.
+#
+# `list sets inet` rather than `list table inet filter`: both return every set
+# with its elements in a single call, but the table form would also hand the
+# web app the rule chain, which it never reads. This grants the same view the
+# five lines below it granted, in one call instead of five.
+retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list sets inet
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter players
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter admins
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter admins_dyn
@@ -42,10 +54,11 @@ retroadmin ALL=(root) NOPASSWD: /usr/bin/tee /run/alephone-server/console
 
 # Restart, start and stop the game units by name. Not `systemctl *`.
 #
-# `stop` was added for #9 under It is narrower than the
-# `restart` already here -- restart can do everything stop can and then brings
-# the unit back -- and the ADR's condition is that the UI records who stopped
-# a server, so a parked server never reads like one that died.
+# `stop` was added for #9. It is narrower than the `restart` already here --
+# restart can do everything stop can and then brings the unit back -- and the
+# condition attached to it was that the UI records who stopped a server, so a
+# parked server never reads like one that died. life_html() is where that
+# promise is kept.
 retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart quakespasm-server
 retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart q2ded
 retroadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart ioq3ded

@@ -40,7 +40,23 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictRealtime=true
 LockPersonality=true
-MemoryMax=128M
+# 128M killed this service on 2026-09-02 at 19:17:53, mid-evening, while one
+# of the two people it exists for was trying to get himself past the firewall.
+# The kernel's own trace names the mechanism: `systemctl invoked oom-killer`
+# inside this cgroup, python3 chosen as the victim for being the largest thing
+# in it. This service forks constantly -- a sudo/nft or systemctl per status
+# poll -- and a fork from a process already near the ceiling is what tips it.
+#
+# It restarted itself five seconds later, so afterwards nothing looked wrong:
+# the only visible trace was cloudflared logging "Unable to reach the origin
+# service" for about 25 seconds, in a journal producing 74,000 lines a day.
+#
+# 384M because the box has 5.1 GB free and steady-state peak is 80M. The cap
+# is here to bound a runaway, not to be grazed in normal use -- a limit a
+# healthy process routinely reaches is not a safety net, it is a scheduled
+# outage. Do not lower it without checking MemoryPeak first:
+#   systemctl show retro-admin -p MemoryPeak
+MemoryMax=384M
 TasksMax=32
 
 [Install]
