@@ -244,6 +244,20 @@ GAMES = {
         # a bot-face lookup, cfg.get("paks")) that already skips alephone.
         "dir": "/opt/alephone-server/Scenarios",
         "gatherer": True,
+        # The one game here whose data ships INSIDE the download, because it
+        # is the one whose data is free: Bungie released the Marathon trilogy,
+        # so the DMG carries Marathon at its top level and Marathon 2 and
+        # Infinity under Scenarios/ -- 184 MB of content in a 104 MB image,
+        # all three scenarios complete. Quake, Quake II, Quake III and
+        # Half-Life ship an engine and nothing else, because their data is
+        # retail and has to come from a copy you own.
+        #
+        # Say so on the downloads page. Without this the Aleph One row simply
+        # had no game-data link and gave no reason, which reads identically to
+        # "someone forgot to upload it" -- and on 2026-09-02 that is exactly
+        # what it was read as, nearly costing a 141 MB zip of files every
+        # client already had.
+        "data_in_build": True,
         "modes": {},
         "settings": [],
     },
@@ -4015,6 +4029,13 @@ def render_downloads():
                         % (g, html.escape(data["name"]),
                            html.escape(sha[:16] + "…" if sha else "not published"),
                            human_bytes(data["size"])))
+        elif cfg.get("data_in_build"):
+            # Not a link, because there is nothing to fetch. It is here so the
+            # row says why it has no game-data button, rather than leaving a
+            # gap that looks like an upload someone forgot.
+            datalink = ("<span class=dl-included title='Bungie released the "
+                        "Marathon trilogy; the download carries all three "
+                        "scenarios'>Data included in download</span>")
         else:
             datalink = ""
         rows.append(
@@ -4044,7 +4065,12 @@ GAMEDATA_FILES = {
     "quake2":   "quake2-data.zip",
     "quake3":   "quake3-data.zip",
     "halflife": "half-life-data.zip",
-    "alephone": "alephone-data.zip",
+    # No alephone entry, deliberately. It named alephone-data.zip, which has
+    # never existed and never should: the DMG already carries all three
+    # Marathon scenarios (see "data_in_build" in the GAMES table). Naming a
+    # file here that is not on disk bought nothing -- gamedata_info() stats
+    # the path and returns None either way -- and cost the reader the
+    # impression that a download was missing. Do not add it back.
     "keeperfx": "keeperfx-data.zip",
 }
 _SUMS_CACHE = {}

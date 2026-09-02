@@ -1089,6 +1089,15 @@ footer code { font: .76rem var(--mono) }
 .dl-data:hover, .dl-data:focus-visible { filter: brightness(1.15); }
 .dl-data:hover, .dl-data:focus-visible { background: var(--ui-soft) }
 .dl-none { flex: none; opacity: 0.5; font-size: 0.9rem; }
+/* Aleph One's data ships inside its download, so this row states that instead
+   of a button. Deliberately NOT styled like .dl-data: it occupies the same
+   width so the Download buttons still line up down the column, but it has no
+   border, no background and no hover, because there is nothing to press. */
+.dl-included {
+  flex: none; min-width: 11rem; text-align: center;
+  padding: 7px 13px; font-size: 0.9rem; color: var(--mut);
+  white-space: nowrap; cursor: default;
+}
 
 /* Older/Newer for the Who played list -- quiet like .dl-data, since paging
    through history is not the reason anyone opened this tab. */
@@ -1109,7 +1118,7 @@ footer code { font: .76rem var(--mono) }
   .dl-row { flex-wrap: wrap; }
   .dl-main { flex-basis: calc(100% - 46px); }
   .dl-actions { flex-basis: 100%; }
-  .dl-get, .dl-data { flex: 1 1 0; min-width: 0; }
+  .dl-get, .dl-data, .dl-included { flex: 1 1 0; min-width: 0; }
 }
 
 /* ----------------------------------------------------------------- match
