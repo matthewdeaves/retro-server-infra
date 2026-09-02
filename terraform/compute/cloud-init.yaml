@@ -73,6 +73,24 @@ write_files:
           flags timeout
         }
 
+        # Who knocked on a game port and was refused. Written by the last rule
+        # in the input chain, read by the admin UI, and never by anything that
+        # grants: it is a record, not an allowlist.
+        #
+        # It exists because a browser behind iCloud Private Relay reports
+        # Apple's egress address rather than the machine in front of it, so
+        # the address the admin UI can see is not the address the games see.
+        # The game client is not relayed, so when it knocks, the box learns
+        # the real one -- which cost an evening to establish the hard way on
+        # 2026-09-02. Short timeout and a size cap because these ports are
+        # scanned constantly; this is a "who just tried" list, not a log.
+        set blocked {
+          type ipv4_addr
+          flags dynamic,timeout
+          timeout 15m
+          size 512
+        }
+
         chain input {
           type filter hook input priority filter; policy drop;
 
@@ -100,6 +118,14 @@ write_files:
 
           tcp dport 4226 ip saddr @players accept
           tcp dport 4226 ip6 saddr @players6 accept
+
+          # Last, so it only ever sees packets every accept above declined.
+          # The drop is what the chain policy would have done anyway; the
+          # point is `update @blocked`, which records the source first. See
+          # the set's own comment for why that address is worth having.
+          udp dport { ${join(", ", game_udp_ports)} } \
+            update @blocked { ip saddr } \
+            drop
         }
 
         chain forward {
