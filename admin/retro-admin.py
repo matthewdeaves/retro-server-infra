@@ -235,6 +235,17 @@ GAMES = {
         # only one you can meaningfully test on your own. The roster is read
         # from the pk3s rather than listed here.
         "has_bots": True,
+        # forceteam only means anything once g_gametype >= GT_TEAM (g_cmds.c,
+        # SetTeam) -- gates the per-player Red/Blue/Spec buttons to the two
+        # team modes below, same source that gates the engine's own check.
+        "has_teams": True,
+        # banaddr/bandel, code/server/sv_ccmds.c. Both write sv_banFile
+        # (default serverbans.dat) immediately -- confirmed real persistence,
+        # unlike quake2's addip/removeip (held back, see #21). bandel takes
+        # the IP/CIDR directly, not listbans' per-category display number
+        # (SV_DelBanFromList, sv_ccmds.c) -- confirmed live, 2026-09-03.
+        "bans": {"add": "banaddr %s", "remove": "bandel %s",
+                "hint": "Persists across a restart."},
         "modes": {
             "ffa":  ("Free for all", ["set g_gametype 0"]),
             "duel": ("Tournament",   ["set g_gametype 1"]),
@@ -262,6 +273,11 @@ GAMES = {
             ("g_weaponrespawn", "Weapon respawn (s)", "int", (0, 60)),
             ("g_motd", "Message of the day", "text", None),
             ("g_password", "Join password", "text", None),
+            # CVAR_ROM, derived from g_password the moment it changes
+            # (g_main.c) -- read-only, no form. CVAR_SERVERINFO though, so
+            # unlike g_password itself this one is live off getstatus.
+            ("g_needpass", "Password required", "readonly",
+             [("0", "No"), ("1", "Yes")]),
             ("g_allowVote", "Voting enabled", "bool", None),         # default on
             ("g_warmup", "Warmup length (s)", "int", (0, 120)),      # default 20
             ("g_doWarmup", "Warmup before matches", "bool", None),   # default off
@@ -275,6 +291,21 @@ GAMES = {
         "accent": "var(--halflife)",
         "fifo": "/run/half-life-server/console", "mapcmd": "changelevel",
         "dir": "/opt/half-life-server/valve", "paks": "*.pak",
+        # IP-only. ID bans exist too (banid/removeid/writeid), but banid can
+        # only ban a client's uuid while they are still connected -- this
+        # engine's status protocol never publishes that uuid to a console-
+        # only client, so there is no ID this UI could ever offer to ban.
+        # addip/removeip take a plain IP/CIDR the admin already has from
+        # elsewhere, same shape as quake3's. Neither addip/removeip nor
+        # banid/removeid write to disk on their own (confirmed against
+        # engine/server/sv_filter.c, xash3d-fwgs@f9043e87) -- "persist"
+        # below is the required follow-up command, same two-step server/
+        # README.md already documents for the rcon path. Requires
+        # server-v1.10.4+ (banned.cfg/listip.cfg exec'd at startup) --
+        # gated in retro-admin.py by the pin, not checked again here.
+        "bans": {"add": "addip 0 %s", "remove": "removeip %s",
+                "persist": "writeip",
+                "hint": "Persists across a restart (server-v1.10.4+)."},
         # Half-Life ships a top-down render of every deathmatch level in
         # valve/overviews, meant for the spectator map. It is not a levelshot,
         # but it is a picture of the level drawn by the people who built it,
@@ -534,6 +565,33 @@ def remember_setting(game, key, value):
     g = _load_grants()
     g.setdefault("_settings", {}).setdefault(game, {})[key] = value
     _save_grants(g)
+
+
+def remembered_bans(game, kind="ip"):
+    """The IP/ID ban list this UI has applied.
+
+    None of these engines let a console-only client (a FIFO write, no rcon
+    reply) read a ban list back, so unlike a live cvar this has nowhere else
+    to come from -- it is only ever right if every ban and unban went through
+    this page. A ban placed some other way (in-game rcon, editing the config
+    by hand) will not show up here even though the engine is enforcing it."""
+    return _load_grants().get("_bans", {}).get(game, {}).get(kind, [])
+
+
+def remember_ban(game, addr, kind="ip"):
+    g = _load_grants()
+    lst = g.setdefault("_bans", {}).setdefault(game, {}).setdefault(kind, [])
+    if addr not in lst:
+        lst.append(addr)
+    _save_grants(g)
+
+
+def forget_ban(game, addr, kind="ip"):
+    g = _load_grants()
+    lst = g.get("_bans", {}).get(game, {}).get(kind, [])
+    if addr in lst:
+        lst.remove(addr)
+        _save_grants(g)
 
 
 def record_grant(ip, who):
@@ -3070,16 +3128,32 @@ def render_match(game, st):
                     "<button class='tiny danger' type=submit>Kick</button></form>"
                     % (html.escape(name), game,
                        html.escape(p.get("name") or "", quote=True)))
+        # Team-move buttons, only where the mode makes them mean anything
+        # (SetTeam only assigns red/blue once g_gametype >= GT_TEAM,
+        # g_cmds.c) -- offering them in ffa/duel would post a command the
+        # engine just ignores.
+        forceteam = ""
+        if GAMES[game].get("has_teams") and st.get("mode") in ("team", "ctf"):
+            raw = p.get("name") or ""
+            forceteam = "".join(
+                "<form method=post action=/forceteam>"
+                "<input type=hidden name=game value='%s'>"
+                "<input type=hidden name=name value='%s'>"
+                "<input type=hidden name=team value='%s'>"
+                "<button class=tiny type=submit>%s</button></form>"
+                % (game, html.escape(raw, quote=True), t, label)
+                for t, label in (("red", "Red"), ("blue", "Blue"),
+                                 ("spectator", "Spec")) if t != side)
         rows.append(
             "<li class='match-row%s%s'>"
             "<span class=match-who>%s<span class=match-name>%s</span></span>"
             "<span class=match-track><span class=match-fill style='width:%.1f%%'></span></span>"
             "<span class=match-score>%d</span>"
-            "<span class='match-ping %s'>%s</span>%s</li>"
+            "<span class='match-ping %s'>%s</span>%s%s</li>"
             % (" lead" if i == 0 and len(players) > 1 and top > 0 else "",
                " side-" + side if side else "",
                face, html.escape(name),
-               pct * 100, score, sidecls, side, kick))
+               pct * 100, score, sidecls, side, forceteam, kick))
 
     # A line of commentary, which is the whimsy. It is also the fastest way to
     # read the state of a game you are not in.
@@ -3296,6 +3370,7 @@ def render_tabs(game, st, listed):
     panels = [("play", "Play", render_shots(game, listed, st.get("map"))),
               ("bots", "Bots", render_bots(game, st)),
               ("set", "Settings", render_settings(game, st)),
+              ("bans", "Bans", render_bans(game)),
               ("conn", "Connect", render_connect(game) + render_say(game))]
     panels = [(k, t, b) for k, t, b in panels if b]
     if len(panels) < 2:
@@ -3461,6 +3536,19 @@ def render_settings(game, st):
         # on every row, which is a label that labels nothing.
         fid = "s-%s-%s" % (game, key)
 
+        if kind == "readonly":
+            # Derived, not settable -- CVAR_ROM in the engine, a no-op if
+            # posted to /set. g_needpass is the first of these: it flips
+            # itself whenever g_password changes, and trying to set it
+            # directly does nothing (confirmed against source, quake3#45).
+            # No form at all, so there is nothing here that could ever look
+            # like a control that silently fails.
+            text = next((t for v, t in extra if v == cur), None) or "unknown"
+            rows.append("<div class=knob-row>"
+                        "<span class=knob>%s<span class=src>%s</span></span>"
+                        "<span class=hint>%s</span></div>"
+                        % (html.escape(label), known, html.escape(text)))
+            continue
         if kind == "bool":
             btns = "".join(
                 "<form method=post action=/set>"
@@ -3555,6 +3643,45 @@ def render_settings(game, st):
     return ("<div class=knobs>%s</div>"
             ""
             % "".join(rows))
+
+
+def render_bans(game):
+    """IP ban/allow list -- add, remove, and what this UI has applied.
+
+    Not what the engine currently enforces: none of these engines let a
+    console-only client read a ban list back (same FIFO-with-no-reply limit
+    that keeps every other panel here write-only), so this is only ever
+    right if every ban and unban went through this page rather than rcon or
+    a hand-edited config. remember_ban()'s docstring says the same thing."""
+    cfg = GAMES[game]
+    spec = cfg.get("bans")
+    if not spec:
+        return ""
+    entries = remembered_bans(game)
+    if entries:
+        rows = "".join(
+            "<li><code>%s</code>"
+            "<form method=post action=/banremove>"
+            "<input type=hidden name=game value='%s'>"
+            "<input type=hidden name=addr value='%s'>"
+            "<button class='tiny danger' type=submit>Unban</button></form></li>"
+            % (html.escape(addr), game, html.escape(addr, quote=True))
+            for addr in entries)
+    else:
+        rows = "<li class=none>Nobody banned through this page.</li>"
+    return (
+        "<div class=knobs>"
+        "<div class=knob-row>"
+        "<form method=post action=/banadd>"
+        "<input type=hidden name=game value='%s'>"
+        "<input name=addr type=text maxlength=64 autocomplete=off "
+        "placeholder='203.0.113.5 or 203.0.113.0/24' aria-label='IP or CIDR to ban'>"
+        "<button class=tiny type=submit>Ban</button></form>"
+        "</div>"
+        "<ul class=list>%s</ul>"
+        "<p class=hint>%s</p>"
+        "</div>"
+        % (game, rows, html.escape(spec.get("hint", ""))))
 
 
 def render_game(game):
@@ -5147,7 +5274,9 @@ class Handler(BaseHTTPRequestHandler):
     GAME_POST_ROUTES = {"/mode": "post_mode", "/map": "post_map",
                         "/set": "post_set", "/say": "post_say",
                         "/bot": "post_bot", "/restart": "post_restart",
-                        "/stop": "post_stop", "/kick": "post_kick"}
+                        "/stop": "post_stop", "/kick": "post_kick",
+                        "/banadd": "post_banadd", "/banremove": "post_banremove",
+                        "/forceteam": "post_forceteam"}
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -5613,6 +5742,68 @@ class Handler(BaseHTTPRequestHandler):
             return self._console_unreachable(cfg, back)
         self.log_message("KICK %s %r by %s", game, name, who)
         return self._redirect("%s: kicked %s." % (cfg["label"], clean_name(game, name)), to=back)
+
+    def post_banadd(self, form, who, game, cfg, back):
+        spec = cfg.get("bans")
+        if not spec:
+            return self._redirect("%s has no ban list." % cfg["label"], ok=False, to=back)
+        addr = field(form, "addr").strip()
+        try:
+            ipaddress.ip_network(addr, strict=False)
+        except ValueError:
+            return self._redirect("Enter a plain IP address or CIDR range.",
+                                  ok=False, to=back)
+        if not console(game, spec["add"] % addr):
+            return self._console_unreachable(cfg, back)
+        if spec.get("persist") and not console(game, spec["persist"]):
+            return self._console_unreachable(cfg, back)
+        remember_ban(game, addr)
+        self.log_message("BAN %s %s by %s", game, addr, who)
+        return self._redirect("%s: banned %s." % (cfg["label"], addr), to=back)
+
+    def post_banremove(self, form, who, game, cfg, back):
+        spec = cfg.get("bans")
+        if not spec:
+            return self._redirect("%s has no ban list." % cfg["label"], ok=False, to=back)
+        addr = field(form, "addr").strip()
+        try:
+            ipaddress.ip_network(addr, strict=False)
+        except ValueError:
+            return self._redirect("Enter a plain IP address or CIDR range.",
+                                  ok=False, to=back)
+        if not console(game, spec["remove"] % addr):
+            return self._console_unreachable(cfg, back)
+        if spec.get("persist") and not console(game, spec["persist"]):
+            return self._console_unreachable(cfg, back)
+        forget_ban(game, addr)
+        self.log_message("UNBAN %s %s by %s", game, addr, who)
+        return self._redirect("%s: removed the ban on %s." % (cfg["label"], addr), to=back)
+
+    def post_forceteam(self, form, who, game, cfg, back):
+        """forceteam <name> <red|blue|spectator> -- SetTeam, g_cmds.c.
+
+        Not an unconditional override: with g_teamForceBalance on, SetTeam
+        can silently refuse a switch that would unbalance the teams further
+        -- confirmed against source, quake3#46. This sends the same command
+        an admin would type; it does not bypass that check, and the redirect
+        says so rather than claiming the move definitely happened."""
+        if not cfg.get("has_teams"):
+            return self._redirect("%s has no teams to force." % cfg["label"],
+                                  ok=False, to=back)
+        name = field(form, "name")
+        team = field(form, "team")
+        if team not in ("red", "blue", "spectator"):
+            return self._redirect("Bad team.", ok=False, to=back)
+        st = live_state(game)
+        if name not in {p.get("name") for p in (st.get("players") or [])}:
+            return self._redirect("That player is not connected any more.",
+                                  ok=False, to=back)
+        if not console(game, "forceteam %s %s" % (name, team)):
+            return self._console_unreachable(cfg, back)
+        self.log_message("FORCETEAM %s %r -> %s by %s", game, name, team, who)
+        return self._redirect(
+            "%s: asked to move %s to %s. Team balance can silently refuse this."
+            % (cfg["label"], clean_name(game, name), team), to=back)
 
     def post_bot(self, form, who, game, cfg, back):
         if not cfg.get("has_bots"):
