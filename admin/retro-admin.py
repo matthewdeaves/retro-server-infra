@@ -192,6 +192,15 @@ GAMES = {
             # instead of a blocklist (g_svcmds.c:179-183).
             ("filterban", "IP list blocks (off: IP list is the only ones allowed)",
              "bool", None),
+            # Space/comma/newline-separated map names, in the order the
+            # rotation plays them (verified against the actual separator set
+            # in EndDMLevel, g_main.c:262: " ,\n\r"). When fraglimit or
+            # timelimit ends the round and the CURRENT map is found in this
+            # list, the next one in the list loads; wrapping to the first at
+            # the end. Empty (the default) falls back to the map's own
+            # `nextmap` key instead -- one map at a time, same as the map
+            # changer already does.
+            ("sv_maplist", "Map rotation (space or comma separated)", "text", None),
         ],
     },
     "quake3": {
@@ -5471,7 +5480,24 @@ class Handler(BaseHTTPRequestHandler):
             value = str(mask)
             label = next(t for b, t in extra if b == bit)
         prefix = "set " if game in ("quake2", "quake3") else ""
-        if not console(game, "%s%s %s" % (prefix, key, value)):
+        sent = value
+        if kind == "text":
+            # Quake II's `set` (Cvar_Set_f) takes exactly argc 3 or 4 and
+            # reads the value as ONE token (Cmd_Argv(2)) -- unlike Quake
+            # III's, which joins everything after the cvar name
+            # (Cmd_ArgsFrom(2)). An unquoted multi-word value silently fails
+            # on quake2 (wrong argc, prints usage, cvar untouched) while
+            # looking identical to success here, and an unquoted EMPTY value
+            # fails on both engines the same way -- quake2 for the same argc
+            # reason, quake3 because argc==2 hits its "print current value"
+            # branch instead of setting anything. Quoting fixes both cases
+            # on both engines: COM_Parse-style tokenizers already strip the
+            # quotes down to one token before Cvar_Set_f/Cmd_ArgsFrom ever
+            # see it, so this is not a shell-style pass-through, and SAFE_SAY
+            # already forbids an embedded '"' from breaking back out.
+            # Verified live on the box both ways, multi-word and empty.
+            sent = '"%s"' % value
+        if not console(game, "%s%s %s" % (prefix, key, sent)):
             return self._console_unreachable(cfg, back)
         remember_setting(game, key, value)
         self.log_message("SET %s %s=%s by %s", game, key, value, who)
