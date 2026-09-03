@@ -154,8 +154,33 @@ for game, cfg in GAMES.items():
             continue
         lo, hi = extra
         want = "7" if lo <= 7 <= hi else str(lo)
-        prefix = "set " if game in ("quake2", "quake3") else ""
-        ra.console(game, "%s%s %s" % (prefix, key, want))
+        if key in cfg.get("restart_settings", ()):
+            # CVAR_LATCH, same as mode_needs_restart above -- a live `set`
+            # changes nothing until the next restart. Reproduce post_set's
+            # own mechanism (mode_file_merge + restart) rather than a plain
+            # console `set`, or this reports a FAIL for a feature that
+            # actually works: maxclients did exactly that until fixed here,
+            # 2026-09-03 -- "engine says 4" because the naive `set` this
+            # loop used to send is simply ignored by a latched cvar.
+            # Force deathmatch mode alongside the value: the coop mode test
+            # just above can leave the mode file in coop, and Quake II's own
+            # SV_InitGame clamps maxclients to 4 there regardless of what was
+            # asked for -- measured live, 2026-09-03, a real engine limit,
+            # not a bug. Parsed from "dm"'s own commands rather than
+            # hardcoded so this keeps working if those cvars ever change.
+            merge = {key: want}
+            dm = cfg["modes"].get("dm") or cfg["modes"].get(cfg.get("default_mode"))
+            if dm:
+                for c in dm[1]:
+                    parts = c.split()
+                    if len(parts) == 3 and parts[0] == "set":
+                        merge.setdefault(parts[1], parts[2])
+            ra.mode_file_merge(game, merge)
+            ra.run(["sudo", "systemctl", "restart", cfg["unit"]])
+            time.sleep(6)
+        else:
+            prefix = "set " if game in ("quake2", "quake3") else ""
+            ra.console(game, "%s%s %s" % (prefix, key, want))
         got = settle(game, want, lambda s: (s.get("cvars") or {}).get(key), tries=6)
         if got is None:
             check("setting %s applied" % key, True,

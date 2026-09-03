@@ -59,10 +59,16 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$SSH_KEY" "$RETRO_SSH_USER@$R
 #              (src/server/sv_init.c:508)
 game_row() {
   case "$1" in
-    quake|q1)       echo "quakespasm-server /run/quakespasm-server/console /opt/quakespasm-server id1    changelevel old-mac-quakespasm   server-v1.18   quakespasm-server-v1.18  quakespasm-server" ;;
-    quake2|q2)      echo "q2ded              /run/quake2-server/console     /opt/quake2-server     baseq2 gamemap     old-mac-quake2       server-v3.0.1  quake2-server-v3.0.1     q2ded" ;;
+    # Asset stem is "quakespasm-server-server-v1.19", not the expected
+    # "quakespasm-server-v1.19" -- server-v1.19's build doubled the
+    # "server" segment (verified: `gh release view server-v1.19` lists
+    # quakespasm-server-server-v1.19-linux-{aarch64,x86_64}.tar.gz, while
+    # server-v1.18's own asset was the un-doubled name). Flagged upstream
+    # as a from:infra bug; this stem matches the real asset until fixed.
+    quake|q1)       echo "quakespasm-server /run/quakespasm-server/console /opt/quakespasm-server id1    changelevel old-mac-quakespasm   server-v1.19   quakespasm-server-server-v1.19  quakespasm-server" ;;
+    quake2|q2)      echo "q2ded              /run/quake2-server/console     /opt/quake2-server     baseq2 gamemap     old-mac-quake2       server-v3.0.2  quake2-server-v3.0.2     q2ded" ;;
     quake3|q3)      echo "ioq3ded            /run/quake3-server/console     /opt/quake3-server     baseq3 map         old-mac-quake3       server-v0.6.7  quake3-server-v0.6.7     ioq3ded" ;;
-    halflife|hl)    echo "xash-server        /run/half-life-server/console  /opt/half-life-server  valve  changelevel old-mac-half-life-1  server-v1.10.3 half-life-server-v1.10.3 xash" ;;
+    halflife|hl)    echo "xash-server        /run/half-life-server/console  /opt/half-life-server  valve  changelevel old-mac-half-life-1  server-v1.10.4 half-life-server-v1.10.4 xash" ;;
     alephone|ao)    echo "alephone-server    /run/alephone-server/console   /opt/alephone-server   Scenarios changelevel alephone          server-v1.0.0  alephone-server-v1.0.0   alephone-server" ;;
     *) echo "unknown game: $1 (quake|quake2|quake3|halflife|alephone)" >&2; return 1 ;;
   esac
@@ -382,7 +388,14 @@ cmd_deploy() {
   # the cleanup cannot remove, which fails the whole run for no reason.
   local stage="/tmp/retro-deploy.$$"
   "${SSH[@]}" "rm -rf $stage && mkdir -p $stage"
-  while read -r g url; do
+  # Read the plan off fd 3, not stdin: each iteration's `ssh` calls inherit
+  # stdin by default, and with the herestring on stdin the first ssh call
+  # drains the rest of $plan out from under the next `read` — a two-or-more
+  # game deploy silently processed only the first game. Verified live,
+  # 2026-09-03: `retro deploy "quake quake2 halflife"` resolved and printed
+  # all three in phase 1, then staged/installed/started only quake, with
+  # quake2 and halflife's stray plan lines swallowed as no-op ssh input.
+  while read -r g url <&3; do
     [ -n "$g" ] || continue
     local bin tag ver; bin=$(binary "$g"); tag=$(ghtag "$g"); ver="${tag#server-}"
     "${SSH[@]}" "set -e
@@ -405,13 +418,13 @@ cmd_deploy() {
       || { "${SSH[@]}" "sudo rm -rf $stage" || true
            die "$g: the release did not check out — nothing was stopped"; }
     echo "    staged and checked, $(unit "$g") still running"
-  done <<< "$plan"
+  done 3<<< "$plan"
 
   # ---- phase 3: swap. A unit is down only for the length of one copy.
   #
   # A running binary cannot be overwritten — cp fails with "Text file busy" —
   # which is the only reason a stop is needed at all.
-  while read -r g url; do
+  while read -r g url <&3; do
     [ -n "$g" ] || continue
     local d u; d=$(dir "$g"); u=$(unit "$g")
     echo "==> installing $g"
@@ -433,12 +446,12 @@ cmd_deploy() {
       sudo find $d -maxdepth 2 -name '*.service' -exec cp {} /etc/systemd/system/ \;
       sudo systemctl daemon-reload"
     echo "    installed to $d"
-  done <<< "$plan"
+  done 3<<< "$plan"
 
   echo "==> local overrides"
   cmd_dropins
 
-  while read -r g url; do
+  while read -r g url <&3; do
     [ -n "$g" ] || continue
     local d u; d=$(dir "$g"); u=$(unit "$g")
     "${SSH[@]}" "sudo systemctl start $u" || true
@@ -478,7 +491,7 @@ cmd_deploy() {
         die "$g: the new build would not stay up, AND the rollback did not leave $u running either. The box is likely down for this game right now — check and fix it by hand before doing anything else."
       fi
     fi
-  done <<< "$plan"
+  done 3<<< "$plan"
 
   "${SSH[@]}" "sudo rm -rf $stage" || true
 
