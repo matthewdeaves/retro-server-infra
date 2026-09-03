@@ -20,7 +20,17 @@
 # with its elements in a single call, but the table form would also hand the
 # web app the rule chain, which it never reads. This grants the same view the
 # five lines below it granted, in one call instead of five.
-retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list sets inet
+#
+# The fork-count fix (2026-09-02) cut this to one call per poll, but the
+# `maintainer` background loop calls it every 20s regardless of whether
+# anyone is browsing -- unlike the per-tab polls, nothing throttles that one
+# by demand. Read-only, so !pam_session/!syslog drop it from two PAM lines
+# and a sudo audit line to nothing in the journal. Scoped to this exact
+# command only -- every line that WRITES (add/delete element, tee, systemctl)
+# keeps its full audit trail below, deliberately.
+Cmnd_Alias SETLIST = /usr/sbin/nft -j list sets inet
+Defaults!SETLIST !pam_session, !syslog
+retroadmin ALL=(root) NOPASSWD: SETLIST
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter players
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter admins
 retroadmin ALL=(root) NOPASSWD: /usr/sbin/nft -j list set inet filter admins_dyn
