@@ -397,7 +397,8 @@ cmd_deploy() {
   # quake2 and halflife's stray plan lines swallowed as no-op ssh input.
   while read -r g url <&3; do
     [ -n "$g" ] || continue
-    local bin tag ver; bin=$(binary "$g"); tag=$(ghtag "$g"); ver="${tag#server-}"
+    local bin tag ver gd; bin=$(binary "$g"); tag=$(ghtag "$g"); ver="${tag#server-}"
+    gd=$(gamedir "$g")
     "${SSH[@]}" "set -e
       s=$stage/$g
       mkdir -p \$s
@@ -407,6 +408,24 @@ cmd_deploy() {
       [ -n \"\$src\" ] || { echo 'tarball had no top-level directory'; exit 1; }
       [ -s \"\$src/$bin\" ] || { echo 'no $bin in the tarball, or it is empty'; exit 1; }
       [ -x \"\$src/$bin\" ] || { echo '$bin is not executable'; exit 1; }
+      # Some tarballs (quake, quake2, halflife) ship server.cfg loose at the
+      # top level, meaning \"the game directory\" by convention, not \"the
+      # directory next to the binary\" -- but cp -a later lands it flatly at
+      # \$d, one level above the actual game directory ($gd) the engine
+      # reads from. Quake III's own tarball already nests it correctly
+      # (baseq3/server.cfg) and needs nothing here.
+      #
+      # Confirmed live, 2026-09-03: this silently meant quake2 and half-
+      # life's server.cfg have never actually been installed by a deploy --
+      # the engine kept running whatever config happened to be in $gd/ from
+      # before, while every release's updated file landed one directory up,
+      # unread. quake2#46's sv_optimize_mp_loadtime fix and half-life#31's
+      # banned.cfg/listip.cfg exec lines both shipped in their tarballs and
+      # never reached the running engine because of exactly this.
+      if [ -n \"$gd\" ] && [ -f \"\$src/server.cfg\" ] && [ ! -f \"\$src/$gd/server.cfg\" ]; then
+        mkdir -p \"\$src/$gd\"
+        mv \"\$src/server.cfg\" \"\$src/$gd/server.cfg\"
+      fi
       # The tag says which build this is meant to be. BUILD-INFO.txt says which
       # build it actually is. They have disagreed before.
       if [ -f \"\$src/BUILD-INFO.txt\" ]; then
@@ -443,8 +462,40 @@ cmd_deploy() {
       sudo systemctl stop $u 2>/dev/null || true
       sudo mkdir -p $d
       sudo cp -a \"\$src\"/. $d/
+      # cp -a preserves the SOURCE's owner, which is whoever untarred it two
+      # steps up (the login user, not root) -- so every path the tarball
+      # touches, including a directory it merges into that already existed,
+      # comes out owned by that login user instead of the game's own service
+      # account. Caught live, 2026-09-03: this silently took away
+      # half-life's own write access to its own valve/ directory, so a
+      # brand-new file (listip.cfg, from the admin UI's new ban list)
+      # failed with 'Permission denied' while every pre-existing file inside
+      # stayed readable and even writable (a file's own permissions, not its
+      # directory's, gate opening it for write) -- so nothing looked wrong
+      # until something tried to CREATE a file there. Reasserting ownership
+      # on exactly the paths the tarball provided, from the unit's own
+      # User=, fixes it without a slow recursive chown over the game content
+      # already sitting alongside it.
+      owner=\$(systemctl show -p User --value $u)
+      if [ -n \"\$owner\" ]; then
+        (cd \"\$src\" && find . -mindepth 1 -printf '%P\n') | while read -r p; do
+          sudo chown \"\$owner:\$owner\" \"$d/\$p\"
+        done
+      fi
       sudo find $d -maxdepth 2 -name '*.service' -exec cp {} /etc/systemd/system/ \;
-      sudo systemctl daemon-reload"
+      sudo systemctl daemon-reload
+      # Quake II's mode/restart-settings mechanism (mode_file_merge in
+      # retro-admin.py) needs baseq2/server.cfg to exec mode.cfg last, and
+      # nothing upstream ships that line -- it is purely this admin UI's own
+      # requirement, so it belongs here, not in old-mac-quake2's release.
+      # Re-added after every deploy because a fresh server.cfg from the
+      # tarball does not carry it: found live, 2026-09-03, when quake2's
+      # actual running server.cfg turned out to be a stale hand-edited copy
+      # that predated this deploy even correctly reaching baseq2/ at all.
+      if [ '$g' = quake2 ] && ! sudo grep -qx 'exec mode.cfg' $d/baseq2/server.cfg; then
+        printf '\n// Mode override written by admin UI (sets deathmatch/coop and restarts)\nexec mode.cfg\n' \
+          | sudo tee -a $d/baseq2/server.cfg >/dev/null
+      fi"
     echo "    installed to $d"
   done 3<<< "$plan"
 
