@@ -2526,6 +2526,43 @@ def human_ago(ts):
     return "%dh ago" % (d // 3600)
 
 
+# When the copy of the site you are looking at went up.
+#
+# The mtime of this very file, read once at import. `retro admin` scps the
+# module and `install`s it without -p, so that mtime is the moment of the
+# deploy, not of the edit -- which is the question the footer is actually
+# answering. Not "when was this written" but "is the page in front of me the
+# change I just pushed, or is it still the old one?". That question was worth
+# an evening on 2026-09-02, when a stale release version and a browser-cached
+# zip each looked exactly like a deploy that had silently done nothing.
+#
+# Read once because the file cannot change under a running process, and a
+# deploy restarts the unit, which re-reads it. If that ever stops being true
+# the footer starts lying, so it is worth knowing.
+try:
+    DEPLOYED_AT = int(os.path.getmtime(os.path.abspath(__file__)))
+except OSError:
+    DEPLOYED_AT = None
+
+
+def human_when(ts):
+    """Relative while that still means something, absolute once it does not.
+
+    human_ago() above tops out at hours, which is right for a grant that lasts
+    twelve of them and wrong here -- a site deployed last week would read
+    "216h ago", which is a number nobody converts in their head."""
+    if ts is None:
+        return "unknown"
+    d = int(time.time()) - ts
+    if d < 90:
+        return "just now"
+    if d < 3600:
+        return "%dm ago" % (d // 60)
+    if d < 86400:
+        return "%dh ago" % (d // 3600)
+    return time.strftime("%d %b", time.localtime(ts)).lstrip("0")
+
+
 def nft_delete(setname, ip):
     """Drop an address from an nftables set. Returns (ok, error).
 
@@ -2688,7 +2725,8 @@ SHELL = """<!doctype html><html lang=en><meta charset=utf-8>
 <div class=stack>@@body@@</div>
 <footer>
   <span class=live id=livebar>live</span> &middot; <span id=hoststats>@@hoststats@@</span><br>
-  @@who@@ &middot; games on <code>@@gameshost@@</code>
+  @@who@@ &middot; games on <code>@@gameshost@@</code><br>
+  site updated @@updated@@
 </footer>
 <!--/email_off-->
 </main>
@@ -2730,6 +2768,16 @@ def shell(title, heading, subtitle, body, current, who, flash="", script="",
                  ("@@script@@", script),
                  ("@@favicon@@", art_url("/emblem/%s.png" % favicon)),
                  ("@@totalplayers@@", html.escape(totalplayers)),
+                 # Absolute time in the tooltip, because "3h ago" cannot be
+                 # compared against the clock on the machine you deployed
+                 # from. The box runs UTC and says so rather than implying
+                 # local time it does not keep.
+                 ("@@updated@@",
+                  "<span title='%s'>%s</span>"
+                  % (html.escape(time.strftime("%Y-%m-%d %H:%M UTC",
+                                               time.gmtime(DEPLOYED_AT))
+                                 if DEPLOYED_AT else "unknown"),
+                     html.escape(human_when(DEPLOYED_AT)))),
                  ("@@hoststats@@", html.escape(hoststats))):
         out = out.replace(k, v)
     return out
