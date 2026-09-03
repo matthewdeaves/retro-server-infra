@@ -212,7 +212,13 @@ GAMES = {
             # what a dedicated server actually runs with in practice, so
             # the range floor is 2, not 1: a one-player "multiplayer"
             # server is not a real setting anyone here would choose.
-            ("maxclients", "Max players (restarts the server)", "int", (2, 16)),
+            # In co-op, SV_InitGame clamps this to 4 regardless of what was
+            # asked for -- confirmed live, 2026-09-03: mode.cfg carrying
+            # "maxclients 7" alongside "coop 1" came back as 4 on restart,
+            # and 7 once deathmatch was set instead. Setting max players
+            # while in co-op mode silently gets less than requested.
+            ("maxclients", "Max players (restarts the server; co-op caps at 4)",
+             "int", (2, 16)),
             ("skill", "Difficulty (restarts the server)", "choice",
              [("0", "Easy"), ("1", "Medium"), ("2", "Hard"), ("3", "Hard+")]),
         ],
