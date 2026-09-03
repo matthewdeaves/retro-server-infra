@@ -131,6 +131,15 @@ GAMES = {
             ("skill", "Skill", "choice", [("0", "Easy"), ("1", "Normal"),
                                           ("2", "Hard"), ("3", "Nightmare")]),
             ("noexit", "Block level exit", "bool", None),
+            # Movement house-rules. Live, no restart -- QuakeSpasm's own
+            # CVAR_NOTIFY broadcasts the new value to every connected player
+            # the moment it changes (host.c, Host_Callback_Notify), so unlike
+            # most of this panel these actually announce themselves.
+            ("sv_gravity", "Gravity", "int", (0, 3200)),      # default 800
+            ("sv_friction", "Friction", "int", (0, 16)),      # default 4
+            ("sv_maxspeed", "Max speed", "int", (0, 1000)),   # default 320
+            ("sv_accelerate", "Acceleration", "int", (0, 50)),# default 10
+            ("pausable", "Players may pause", "bool", None),  # default on
         ],
     },
     "quake2": {
@@ -169,6 +178,20 @@ GAMES = {
                 (256,   "No friendly fire"),
                 (4096,  "Allow exit"),
             ]),
+            # password/spectator_password are CVAR_USERINFO, not CVAR_NOSET --
+            # plain `set`, no special ACL beyond rcon_password itself
+            # (savegame.c:290-291). needpass is CVAR_SERVERINFO and derived
+            # automatically from these two (g_main.c:341-361); it is not
+            # listed here because it is read-only -- setting it directly
+            # would just be overwritten on the next password change.
+            ("password", "Join password", "text", None),
+            ("spectator_password", "Spectator password", "text", None),
+            # Default is 1 (blocklist) at the engine, verified against
+            # savegame.c:293 -- `gi.cvar("filterban", "1", 0)` -- not 0 as
+            # first reported. Off flips addip/removeip into an allowlist
+            # instead of a blocklist (g_svcmds.c:179-183).
+            ("filterban", "IP list blocks (off: IP list is the only ones allowed)",
+             "bool", None),
         ],
     },
     "quake3": {
@@ -195,6 +218,13 @@ GAMES = {
             ("capturelimit", "Capture limit", "int", (0, 50)),
             ("g_friendlyFire", "Friendly fire", "bool", None),
             ("g_weaponrespawn", "Weapon respawn (s)", "int", (0, 60)),
+            ("g_motd", "Message of the day", "text", None),
+            ("g_password", "Join password", "text", None),
+            ("g_allowVote", "Voting enabled", "bool", None),         # default on
+            ("g_warmup", "Warmup length (s)", "int", (0, 120)),      # default 20
+            ("g_doWarmup", "Warmup before matches", "bool", None),   # default off
+            ("g_teamAutoJoin", "Auto-assign new players to a team", "bool", None),
+            ("g_teamForceBalance", "Keep teams balanced", "bool", None),
         ],
     },
     "halflife": {
@@ -230,6 +260,14 @@ GAMES = {
             ("mp_friendlyfire", "Friendly fire", "bool", None),
             ("mp_falldamage", "Fall damage", "bool", None),
             ("mp_footsteps", "Footsteps", "bool", None),
+            # Movement house-rules. Engine-level (FCVAR_SERVER|FCVAR_MOVEVARS,
+            # sv_main.c:86-98), not the missing game DLL, so these are
+            # confirmed present on this build unlike the mp_* rules above.
+            ("sv_gravity", "Gravity", "int", (0, 3200)),          # default 800
+            ("sv_friction", "Friction", "int", (0, 16)),          # default 4
+            ("sv_maxspeed", "Max speed", "int", (0, 1000)),       # default 320
+            ("sv_accelerate", "Acceleration", "int", (0, 50)),    # default 10
+            ("sv_airaccelerate", "Air acceleration", "int", (0, 50)), # default 10
         ],
     },
     "alephone": {
@@ -3390,6 +3428,23 @@ def render_settings(game, st):
                         "<span class=knob id='%s'>%s<span class=src>%s</span></span>"
                         "<div class=chips role=group aria-labelledby='%s'>%s</div>"
                         "</div>" % (fid, html.escape(label), known, fid, "".join(sw)))
+        elif kind == "text":
+            # A password or MOTD string, not a number. Sent through the same
+            # console FIFO everything else uses, so it has to obey the same
+            # rule chat already does: SAFE_SAY, because an unescaped newline
+            # or semicolon in this field is a second console command, not
+            # part of the value.
+            rows.append(
+                "<div class=knob-row>"
+                "<label class=knob for='%s'>%s<span class=src>%s</span></label>"
+                "<form method=post action=/set>"
+                "<input type=hidden name=game value='%s'><input type=hidden name=key value='%s'>"
+                "<input id='%s' name=value type=text maxlength=120 autocomplete=off "
+                "value='%s' placeholder='(empty)'>"
+                "<button class=tiny type=submit>Set</button></form>"
+                "</div>"
+                % (fid, html.escape(label), known, game, key, fid,
+                   html.escape(str(cur)) if cur is not None else ""))
         else:
             lo, hi = extra
             rows.append(
@@ -5355,6 +5410,14 @@ class Handler(BaseHTTPRequestHandler):
         elif kind == "choice":
             if value not in [v for v, _ in extra]:
                 return self._redirect("Bad value.", ok=False, to=back)
+        elif kind == "text":
+            # Empty is a legal value (clears a password/MOTD); anything else
+            # has to be safe to sit on a console command line, same rule as
+            # chat -- SAFE_SAY already forbids the newline/semicolon/quote
+            # that would turn one console write into two.
+            if value and not SAFE_SAY.match(value):
+                return self._redirect("%s: use plain text, no quotes or newlines."
+                                      % label, ok=False, to=back)
         elif kind == "bits":
             # One switch was pressed; the cvar is all of them added up, so
             # the rest have to be preserved. Read the mask back from the
