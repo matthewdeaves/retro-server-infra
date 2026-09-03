@@ -3026,16 +3026,31 @@ def render_match(game, st):
             face = ("<img class=match-face src='%s' alt='' width=20 height=20 loading=lazy>"
                     % art_url("/icon/%s/%s.png" % (game, urllib.parse.quote(name))))
         side = p.get("team") if p.get("team") in ("red", "blue") else ""
+        # Kick, not for a bot (bot roster/removal is its own control below)
+        # and not for a gatherer game (alephone has no console to send it
+        # through at all -- render_say already skips that game for the same
+        # reason). The name sent is the RAW name the engine reported, not
+        # the display-cleaned one -- post_kick matches it against a fresh
+        # live_state() read, and a Quake III colour code stripped for
+        # display would never match what the engine actually has on file.
+        kick = ""
+        if not GAMES[game].get("gatherer") and not (ping == "0" and name in roster):
+            kick = ("<form method=post action=/kick data-confirm='Kick %s?'>"
+                    "<input type=hidden name=game value='%s'>"
+                    "<input type=hidden name=name value='%s'>"
+                    "<button class='tiny danger' type=submit>Kick</button></form>"
+                    % (html.escape(name), game,
+                       html.escape(p.get("name") or "", quote=True)))
         rows.append(
             "<li class='match-row%s%s'>"
             "<span class=match-who>%s<span class=match-name>%s</span></span>"
             "<span class=match-track><span class=match-fill style='width:%.1f%%'></span></span>"
             "<span class=match-score>%d</span>"
-            "<span class='match-ping %s'>%s</span></li>"
+            "<span class='match-ping %s'>%s</span>%s</li>"
             % (" lead" if i == 0 and len(players) > 1 and top > 0 else "",
                " side-" + side if side else "",
                face, html.escape(name),
-               pct * 100, score, sidecls, side))
+               pct * 100, score, sidecls, side, kick))
 
     # A line of commentary, which is the whimsy. It is also the fastest way to
     # read the state of a game you are not in.
@@ -5075,7 +5090,7 @@ class Handler(BaseHTTPRequestHandler):
     GAME_POST_ROUTES = {"/mode": "post_mode", "/map": "post_map",
                         "/set": "post_set", "/say": "post_say",
                         "/bot": "post_bot", "/restart": "post_restart",
-                        "/stop": "post_stop"}
+                        "/stop": "post_stop", "/kick": "post_kick"}
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -5472,6 +5487,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._console_unreachable(cfg, back)
         self.log_message("SAY %s %r by %s", game, text[:60], who)
         return self._redirect("Sent to %s." % cfg["label"], to=back)
+
+    def post_kick(self, form, who, game, cfg, back):
+        """`kick <name>` on purpose, never a slot number.
+
+        All four engines' kick command accepts a name (Quake:
+        host_cmd.c:1999-2076, Quake II: SV_SetPlayer falls through to a name
+        match, Quake III: SV_GetPlayerByHandle, Half-Life: SV_ClientByName),
+        but the NUMBER each one expects is not the same number, and for
+        Half-Life it is not even the number `status` prints -- `status`
+        shows the connection slot, `kick #N` wants a separate, persistent
+        userid that only happens to match before a reconnect (verified in
+        sv_client.c). Kicking by exact name sidesteps every one of those
+        four different numbering schemes at once, at the cost of nothing:
+        the name has to match a name live_state() reports right now, read
+        fresh, so there is no free-text injection surface here either."""
+        if cfg.get("gatherer"):
+            return self._redirect("%s has no console to kick from." % cfg["label"],
+                                  ok=False, to=back)
+        name = field(form, "name")
+        st = live_state(game)
+        if name not in {p.get("name") for p in (st.get("players") or [])}:
+            return self._redirect("That player is not connected any more.",
+                                  ok=False, to=back)
+        if not console(game, "kick %s" % name):
+            return self._console_unreachable(cfg, back)
+        self.log_message("KICK %s %r by %s", game, name, who)
+        return self._redirect("%s: kicked %s." % (cfg["label"], clean_name(game, name)), to=back)
 
     def post_bot(self, form, who, game, cfg, back):
         if not cfg.get("has_bots"):
