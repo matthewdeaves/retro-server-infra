@@ -211,6 +211,19 @@ GAMES = {
             "duel": ("Tournament",   ["set g_gametype 1"]),
             "team": ("Team DM",      ["set g_gametype 3"]),
             "ctf":  ("Capture flag", ["set g_gametype 4"]),
+            # GT_1FCTF/GT_OBELISK/GT_HARVESTER (bg_public.h:106-108) exist as
+            # enum values and g_gametype accepts 5/6/7 without erroring, but
+            # do NOT add them here: the actual gameplay code for all three is
+            # inside #ifdef MISSIONPACK in g_items.c (flag/obelisk/cube
+            # checks and scoring), and this build is compiled with
+            # BUILD_MISSIONPACK=0 on purpose (scripts/build-gamedylibs-
+            # arm64.sh:57, "we ship baseq3 only"). Verified live on the box,
+            # 2026-09-03: setting g_gametype 6 and loading q3dm17 logged
+            # "0 teams with 0 entities" -- it runs as deathmatch with no
+            # obelisk ever spawning, not an error, just silently pointless.
+            # An earlier source-only survey called these "fully implemented,
+            # just not in the dropdown" -- that was wrong; it grepped the
+            # source tree without checking the build flags actually used.
         },
         "settings": [
             ("fraglimit", "Frag limit", "int", (0, 200)),
