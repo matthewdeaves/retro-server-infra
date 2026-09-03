@@ -157,6 +157,12 @@ GAMES = {
         # SV_SpawnServer. See sv_init.c:332.
         "mode_needs_restart": True,
         "mode_file": "/opt/quake2-server/baseq2/mode.cfg",
+        # Settings that share mode.cfg's restart mechanism because the
+        # engine only reads them at CVAR_LATCH time (server/sv_main.c:621
+        # for maxclients, game/savegame/savegame.c for skill -- both
+        # verified CVAR_LATCH). post_set routes these through the same
+        # merge-then-restart path post_mode uses, not a live console `set`.
+        "restart_settings": {"maxclients", "skill"},
         "campaign_start": "base1",
         "modes": {
             "dm":   ("Deathmatch", ["set deathmatch 1", "set coop 0"]),
@@ -201,6 +207,14 @@ GAMES = {
             # `nextmap` key instead -- one map at a time, same as the map
             # changer already does.
             ("sv_maplist", "Map rotation (space or comma separated)", "text", None),
+            # Both CVAR_LATCH -- see restart_settings above. maxclients'
+            # engine default is 1 (sv_main.c:621), which is not remotely
+            # what a dedicated server actually runs with in practice, so
+            # the range floor is 2, not 1: a one-player "multiplayer"
+            # server is not a real setting anyone here would choose.
+            ("maxclients", "Max players (restarts the server)", "int", (2, 16)),
+            ("skill", "Difficulty (restarts the server)", "choice",
+             [("0", "Easy"), ("1", "Medium"), ("2", "Hard"), ("3", "Hard+")]),
         ],
     },
     "quake3": {
@@ -3375,6 +3389,34 @@ def config_defaults(game, ttl=300):
     return out
 
 
+def mode_file_merge(game, updates):
+    """Merge `updates` into mode_file's existing `set key value` lines and
+    write the whole thing back, rather than replacing the file.
+
+    post_mode used to `tee` the file with ONLY the mode's own two cvars
+    every time -- fine while mode.cfg held nothing else, but
+    restart_settings (maxclients, skill) now shares this same file and this
+    same restart mechanism, and a plain overwrite would silently erase
+    whichever of the two a previous write put there. Read first, update
+    just the given keys, write all of them back -- the same parsing
+    config_defaults() above already does for this file, kept in step with
+    it on purpose."""
+    mode_file = GAMES[game]["mode_file"]
+    current = {}
+    try:
+        with open(mode_file, encoding="latin-1") as f:
+            for line in f:
+                parts = line.split("//")[0].strip().split()
+                if len(parts) == 3 and parts[0].lower() == "set":
+                    current[parts[1]] = parts[2].strip('"')
+    except OSError:
+        pass
+    current.update(updates)
+    body = "\n".join("set %s %s" % kv for kv in current.items()) + "\n"
+    w = run(["sudo", "tee", mode_file], stdin=body)
+    return w.returncode == 0
+
+
 def render_settings(game, st):
     """Only some of these can be read back.
 
@@ -5370,9 +5412,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect("No maps found for %s." % title, ok=False, to=back)
 
         if cfg.get("mode_needs_restart"):
-            body = "\n".join(cmds) + "\n"
-            w = run(["sudo", "tee", cfg["mode_file"]], stdin=body)
-            if w.returncode:
+            # cmds is this codebase's own data (GAMES[...]["modes"]), always
+            # "set <key> <value>" -- trusted to parse cleanly, not user input.
+            updates = {}
+            for c in cmds:
+                parts = c.split()
+                if len(parts) == 3 and parts[0] == "set":
+                    updates[parts[1]] = parts[2]
+            if not mode_file_merge(game, updates):
                 return self._redirect("Could not write the %s mode file."
                                       % cfg["label"], ok=False, to=back)
             if run(["sudo", "systemctl", "restart", cfg["unit"]]).returncode:
@@ -5479,6 +5526,26 @@ class Handler(BaseHTTPRequestHandler):
             mask = (mask | bit) if value == "1" else (mask & ~bit)
             value = str(mask)
             label = next(t for b, t in extra if b == bit)
+
+        if key in cfg.get("restart_settings", ()):
+            # CVAR_LATCH: a live `set` changes nothing until the engine's
+            # next SV_InitGame, same reason the coop/dm mode toggle needs a
+            # restart. Shares mode.cfg with that toggle, so merge rather
+            # than overwrite -- see mode_file_merge().
+            if not mode_file_merge(game, {key: value}):
+                return self._redirect("Could not write the %s mode file."
+                                      % cfg["label"], ok=False, to=back)
+            if run(["sudo", "systemctl", "restart", cfg["unit"]]).returncode:
+                return self._redirect("Restart of %s failed." % cfg["label"],
+                                      ok=False, to=back)
+            time.sleep(3)
+            remember_setting(game, key, value)
+            self.log_message("SET %s %s=%s (via restart) by %s", game, key, value, who)
+            return self._redirect(
+                "%s: %s set to %s. Everyone was disconnected — this engine "
+                "only reads that setting at startup." % (cfg["label"], label, value),
+                to=back)
+
         prefix = "set " if game in ("quake2", "quake3") else ""
         sent = value
         if kind == "text":
