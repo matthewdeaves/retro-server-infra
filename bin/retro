@@ -21,7 +21,7 @@
 #   retro verify [game] [--force]    prove the controls work (DISTURBS the servers)
 #   retro dropins                    install the local systemd overrides
 #   retro drift                      does the box still match this checkout?
-#   retro content <game>             upload game content from ~/srv-build
+#   retro content <game>             upload game content from ~/oldmac/srv-build
 #   retro gamedata                   push game-data/*.zip to the box and verify
 #   retro ssh                        shell on the box
 #   retro box stop | box start       power the Oracle instance off/on
@@ -94,11 +94,11 @@ binary()  { field "$1" 9; }
 # code, not content, and that rule does not stop at their boundary.
 content_src() {
   case "$1" in
-    quake|q1)    echo "$HOME/srv-build/deploy/q1/id1" ;;
-    quake2|q2)   echo "$HOME/srv-build/deploy/q2/baseq2" ;;
-    quake3|q3)   echo "$HOME/srv-build/smoke/q3root/baseq3" ;;
-    halflife|hl) echo "$HOME/srv-build/smoke/hlroot/valve" ;;
-    alephone|ao) echo "$HOME/srv-build/smoke/alephone" ;;
+    quake|q1)    echo "$HOME/oldmac/srv-build/deploy/q1/id1" ;;
+    quake2|q2)   echo "$HOME/oldmac/srv-build/deploy/q2/baseq2" ;;
+    quake3|q3)   echo "$HOME/oldmac/srv-build/smoke/q3root/baseq3" ;;
+    halflife|hl) echo "$HOME/oldmac/srv-build/smoke/hlroot/valve" ;;
+    alephone|ao) echo "$HOME/oldmac/srv-build/smoke/alephone" ;;
   esac
 }
 
