@@ -33,3 +33,9 @@ journald. `server-v2.7.1` flushes for itself, so that override is gone.
 
 Quake III and Half-Life need neither: both read a non-tty stdin quite happily,
 which is why this went unnoticed for so long — three of the four worked.
+
+**`xash-server`** — sends `log on` down the console FIFO at every start
+(`ExecStartPost`). Otherwise xash journals nothing when a player joins, so
+a join cannot be confirmed from the server (#27). `mp_logecho` is already 1
+in the game DLL, so once the log is on, connect and "entered the game" lines
+go to the console and from there into the journal.
