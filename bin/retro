@@ -576,8 +576,14 @@ cmd_content() {
   #
   # Half-Life survives this by accident — Xash names its libs hl_arm64.so and
   # hl_amd64.so, so they coexist. Do not rely on that.
+  #
+  # Never sync server.cfg either. `retro deploy` owns it: it comes from the
+  # release tarball, and Quake II's gets `exec mode.cfg` appended. The
+  # srv-build trees carry a 2026-08-20 smoke-test copy, and a dry run on
+  # 2026-09-22 showed this rsync would overwrite the live quake2 and
+  # halflife server.cfg with it (#25).
   rsync -avP --no-perms --no-owner --no-group \
-    --exclude='*.so' --exclude='*.dll' --exclude='*.dylib' \
+    --exclude='*.so' --exclude='*.dll' --exclude='*.dylib' --exclude='server.cfg' \
     --exclude='qconsole.log' --exclude='.DS_Store' \
     -e "ssh -i $SSH_KEY -o BatchMode=yes" \
     "$src/" "$RETRO_SSH_USER@$RETRO_SERVER_IP:$dst/"
