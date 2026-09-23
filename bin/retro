@@ -1089,7 +1089,7 @@ cmd_box_start() {
   echo "running at $ip"
   if [ "$ip" != "$RETRO_SERVER_IP" ]; then
     echo "IP CHANGED (.env says $RETRO_SERVER_IP) — updating DNS and .env"
-    sed -i.bak "s/^RETRO_SERVER_IP=.*/RETRO_SERVER_IP=$ip/" "$REPO_ROOT/.env"
+    sed -i '' "s/^RETRO_SERVER_IP=.*/RETRO_SERVER_IP=$ip/" "$REPO_ROOT/.env"
     cmd_dns_sync "$ip"
   fi
 }
@@ -1100,7 +1100,7 @@ cmd_dns_sync() {
       --query 'data[0]."public-ip"' --raw-output)
   echo "pointing DNS at $ip"
   ( cd "$REPO_ROOT/terraform/cloudflare" \
-    && sed -i.bak "s/^server_ip = .*/server_ip = \"$ip\"/" terraform.tfvars \
+    && sed -i '' "s/^server_ip = .*/server_ip = \"$ip\"/" terraform.tfvars \
     && CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-$(cat ~/.cloudflare/token)}" \
        tofu apply -auto-approve -no-color | tail -3 )
   # The Quake unit pins -ip so NetQuake stops advertising 127.0.1.1 on Ubuntu.
