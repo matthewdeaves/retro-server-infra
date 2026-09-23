@@ -157,12 +157,11 @@ Changed the admin UI? `./bin/retro admin` puts it on the box -- it runs
 refuses to install anything that fails, and restores the previous
 `retro-admin.py` if `/healthz` doesn't answer afterward. Don't `scp` it up by hand.
 
-## Gotchas that will actually bite you
+## Gotchas
 
 - **Never resize the instance up, never upgrade the tenancy to Pay As You
-  Go.** An Always Free tenancy that's never been upgraded literally cannot
-  be billed -- it refuses to provision rather than charging you. That's the
-  real safety net.
+  Go.** An Always Free tenancy that's never been upgraded cannot be
+  billed -- it refuses to provision rather than charging.
 - **Always read `tofu plan` before applying.** Oracle replaces the instance
   for any `user_data` change, so `metadata` is in `ignore_changes`:
   `cloud-init.yaml` edits reach only a new instance, via a deliberate
