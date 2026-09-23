@@ -59,13 +59,7 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$SSH_KEY" "$RETRO_SSH_USER@$R
 #              (src/server/sv_init.c:508)
 game_row() {
   case "$1" in
-    # Asset stem is "quakespasm-server-server-v1.19", not the expected
-    # "quakespasm-server-v1.19" -- server-v1.19's build doubled the
-    # "server" segment (verified: `gh release view server-v1.19` lists
-    # quakespasm-server-server-v1.19-linux-{aarch64,x86_64}.tar.gz, while
-    # server-v1.18's own asset was the un-doubled name). Flagged upstream
-    # as a from:infra bug; this stem matches the real asset until fixed.
-    quake|q1)       echo "quakespasm-server /run/quakespasm-server/console /opt/quakespasm-server id1    changelevel old-mac-quakespasm   server-v1.19   quakespasm-server-server-v1.19  quakespasm-server" ;;
+    quake|q1)       echo "quakespasm-server /run/quakespasm-server/console /opt/quakespasm-server id1    changelevel old-mac-quakespasm   server-v1.20   quakespasm-server-v1.20         quakespasm-server" ;;
     quake2|q2)      echo "q2ded              /run/quake2-server/console     /opt/quake2-server     baseq2 gamemap     old-mac-quake2       server-v3.0.2  quake2-server-v3.0.2     q2ded" ;;
     quake3|q3)      echo "ioq3ded            /run/quake3-server/console     /opt/quake3-server     baseq3 map         old-mac-quake3       server-v0.6.7  quake3-server-v0.6.7     ioq3ded" ;;
     halflife|hl)    echo "xash-server        /run/half-life-server/console  /opt/half-life-server  valve  changelevel old-mac-half-life-1  server-v1.10.4 half-life-server-v1.10.4 xash" ;;
