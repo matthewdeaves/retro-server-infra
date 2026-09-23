@@ -13,6 +13,8 @@
   anything, and puts the old files back if the new build will not stay up. It
   used to stop the unit first and look the release up second, which turned a
   deleted release or a short download into an outage. Keep that order.
+  Its restore-on-failed-start is in-run only: staging is deleted every run,
+  no copy is kept, and a real fix ships forward as a new release.
 - **`retro deploy <game>` installs the tag PINNED in `bin/retro`'s game
   table, never whatever is newest on GitHub.** It does not check. Deploying
   without first bumping the pin either fails loudly (asset for the old tag is
