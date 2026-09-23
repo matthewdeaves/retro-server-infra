@@ -164,6 +164,7 @@ runcmd:
   - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, quake3 ]
   - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, halflife ]
   - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, alephone ]
+  - [ useradd, --system, --no-create-home, --shell, /usr/sbin/nologin, retroadmin ]
 
   - [ mkdir, -p, /opt/quakespasm-server, /opt/quake2-server, /opt/quake3-server, /opt/half-life-server, /opt/alephone-server ]
 

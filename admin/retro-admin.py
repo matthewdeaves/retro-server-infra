@@ -4084,8 +4084,8 @@ NOT_MODIFIED = object()
 # allowlist, where it can only ever match strangers.
 #
 # Measured on 2026-09-02, a real evening lost to exactly this: three separate
-# grants for one person, 2a09:bac3:3770:23cd::391:82 (relay v6),
-# 140.248.40.25 (Fastly relay), 104.28.30.132 (Cloudflare relay), and the page
+# grants for one person, one relay v6, one Fastly relay and one Cloudflare
+# relay address, and the page
 # telling him each time that he was allowed in. His actual client was on
 # his real home address the whole time. It only worked when he signed in with Chrome,
 # which Private Relay does not touch.
@@ -5340,7 +5340,7 @@ class Handler(BaseHTTPRequestHandler):
         #
         # But granting it here does not mean it works: confirmed live
         # 2026-09-02 that the box has no public IPv6 address at all (`ip -6
-        # addr show scope global` is empty) and games/g.matthewdeaves.com
+        # addr show scope global` is empty) and the games hostnames
         # carry no AAAA record — the game ports are IPv4-only end to end,
         # regardless of what nftables says. A v6 grant can never be
         # followed by a working game connection, so the message must not

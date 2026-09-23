@@ -260,7 +260,7 @@ fi
 # ---------------------------------------------------- 8. ART_REV keeps up
 # Artwork is cached to disk and never re-derived, so a change to a picture or
 # to the code that decodes one is invisible unless the revision moves.
-art_touched=$(printf '%s\n' "$changed" | grep -E '^admin/art/' || true)
+art_touched=$(printf '%s\n' "$changed" | grep -E '^admin/art/.*\.(png|jpe?g|gif|webp)$' || true)
 pipeline_touched=$(git diff --cached -U0 -- admin/retro-admin.py 2>/dev/null \
                    | grep -E '^\+' | grep -cE 'EMBLEMS|_shot_raw|_dechroma|emblem_png|map_shot_png|bot_icon_png' || true)
 rev_touched=$(git diff --cached -U0 -- admin/retro-admin.py 2>/dev/null \

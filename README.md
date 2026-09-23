@@ -96,7 +96,7 @@ cp terraform/cloudflare/terraform.tfvars.example terraform/cloudflare/terraform.
 ```
 
 Fill in `terraform/compute/terraform.tfvars` (your tenancy OCID, a budget
-alert email), then:
+alert email, and `region` if your home region isn't `uk-london-1`), then:
 
 ```sh
 cd terraform/compute && tofu init && tofu plan   # read it before applying
@@ -108,7 +108,8 @@ Fill in `terraform/cloudflare/terraform.tfvars` (account/zone IDs from your
 domain's Overview page, the IP from above, your admin email(s)), then:
 
 ```sh
-cd ../cloudflare && tofu init && tofu apply
+cd ../cloudflare && tofu init
+CLOUDFLARE_API_TOKEN=$(cat ~/.cloudflare/token) tofu apply
 ```
 
 Fill in `.env` at the repo root -- `RETRO_SERVER_IP` (the same IP), your SSH
@@ -118,6 +119,14 @@ On the box, create `/etc/retro-admin/admin.env` from
 `admin/retro-admin.env.example` with your real domain/team/email values (this
 file is deliberately not pushed by any deploy step -- it's instance-specific,
 same as `.env`).
+
+A fresh box admits no SSH: `admins` starts empty and only the admin UI
+fills `admins_dyn`. Once, from the OCI serial console: add your address
+(`sudo nft add element inet filter admins_dyn '{ <ip> timeout 12h }'`),
+`useradd --system --no-create-home --shell /usr/sbin/nologin retroadmin`,
+install the arm64 `cloudflared` .deb, write `tofu output -raw tunnel_token`
+(cloudflare module) to `/etc/cloudflared/token`, and run it as a unit with
+`cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token`.
 
 Then push the pieces:
 
@@ -145,8 +154,8 @@ email is the durable identity and the IP isn't.
 
 Changed the admin UI? `./bin/retro admin` puts it on the box -- it runs
 `selftest` first (renders every page, fetches every referenced image),
-refuses to install anything that fails, and rolls back if `/healthz` doesn't
-answer afterward. Don't `scp` it up by hand.
+refuses to install anything that fails, and restores the previous
+`retro-admin.py` if `/healthz` doesn't answer afterward. Don't `scp` it up by hand.
 
 ## Gotchas that will actually bite you
 
@@ -154,11 +163,10 @@ answer afterward. Don't `scp` it up by hand.
   Go.** An Always Free tenancy that's never been upgraded literally cannot
   be billed -- it refuses to provision rather than charging you. That's the
   real safety net.
-- **Always read `tofu plan` before applying.** `cloud-init.yaml` is rendered
-  from `user_data`, and Oracle treats any `user_data` change as requiring a
-  whole new instance -- editing a firewall variable once produced `1 added,
-  1 changed, 1 destroyed` and silently rebuilt the box, wiping everything on
-  it. If a plan says anything is being destroyed, stop.
+- **Always read `tofu plan` before applying.** Oracle replaces the instance
+  for any `user_data` change, so `metadata` is in `ignore_changes`:
+  `cloud-init.yaml` edits reach only a new instance, via a deliberate
+  `tofu taint`. If a plan says anything is being destroyed, stop.
 - **`map` and `changelevel` are not synonyms** in Quake and Half-Life --
   `map` disconnects every player first. `bin/retro map` encodes the correct
   command per engine; don't send raw console commands for map changes.

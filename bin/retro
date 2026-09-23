@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# retro — control the four retro game servers.
+# retro — control the retro game servers.
 #
 # Everything runs over SSH. There is no rcon anywhere in this script and there
 # should never be: each systemd unit opens a console FIFO on fd 3 and holds it
@@ -260,7 +260,7 @@ engine_canary() {
     fi
   done
   if [ "$rc" -eq 0 ]; then
-    printf "  %-40s %s\n" "engines answering" "all four"
+    printf "  %-40s %s\n" "engines answering" "all of them"
     return 0
   fi
   printf "  %-40s %s\n" "engines answering" "SILENT:$silent"
@@ -693,7 +693,7 @@ cmd_drift() {
   # about the four servers, which is exactly the gap #7 was about. Naming what
   # is still unchecked is the point: a clean result that overstates its reach
   # is the failure this whole check exists to avoid.
-  echo "no drift: every tracked file and all four server versions match this checkout"
+  echo "no drift: every tracked file and every server version matches this checkout"
   echo "  not checked: whether a server binary was built from the source its version"
   echo "  claims. This repo builds nothing and cannot attest that."
 }
