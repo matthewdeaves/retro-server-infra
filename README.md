@@ -5,10 +5,10 @@ old-Mac game ports, running on a single Oracle Cloud Always Free instance.
 
 | Game | Repo | Server tag pinned in `bin/retro` |
 |---|---|---|
-| Quake | [`old-mac-quakespasm`](https://github.com/matthewdeaves/old-mac-quakespasm) | `server-v1.18` |
-| Quake II | [`old-mac-quake2`](https://github.com/matthewdeaves/old-mac-quake2) | `server-v3.0.1` |
+| Quake | [`old-mac-quakespasm`](https://github.com/matthewdeaves/old-mac-quakespasm) | `server-v1.19` |
+| Quake II | [`old-mac-quake2`](https://github.com/matthewdeaves/old-mac-quake2) | `server-v3.0.2` |
 | Quake III Arena | [`old-mac-quake3`](https://github.com/matthewdeaves/old-mac-quake3) | `server-v0.6.7` |
-| Half-Life | [`old-mac-half-life-1`](https://github.com/matthewdeaves/old-mac-half-life-1) | `server-v1.10.3` |
+| Half-Life | [`old-mac-half-life-1`](https://github.com/matthewdeaves/old-mac-half-life-1) | `server-v1.10.4` |
 | Aleph One (Marathon) | [`alephone`](https://github.com/matthewdeaves/alephone) | `server-v1.0.0` |
 
 **This repo builds nothing.** Those five repos build and ship server binaries
