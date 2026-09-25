@@ -2892,9 +2892,9 @@ def nav_html(current):
 
 def shell(title, heading, subtitle, body, current, who, flash="", script="",
           totalplayers="", hoststats="", favicon="quake3"):
-    """`favicon` is a game name: the tab gets that game's icon, so four tabs
-    open on four servers are told apart at a glance. It also stops every page
-    load ending in a 404 for /favicon.ico."""
+    """`favicon` is a game name: the tab gets that game's icon, so tabs
+    open on different servers are told apart at a glance. It also stops every
+    page load ending in a 404 for /favicon.ico."""
     out = SHELL
     for k, v in (("@@css@@", CSS), ("@@appjs@@", APP_JS),
                  ("@@title@@", html.escape(title)),
@@ -5228,7 +5228,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/":
             return self._send(200, shell("Overview", "Retro game servers",
-                                         "Four servers, one box in London.",
+                                         "Five servers, one box in London.",
                                          page_overview(ip, allowed, ua), "/", who, flash,
                                          REFRESH_JS, players_line_text, hostline))
         if u.path == "/access":

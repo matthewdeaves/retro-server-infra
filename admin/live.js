@@ -66,9 +66,9 @@
   // The countdown has always been correct and has always been the same muted
   // grey at three hours as at four minutes, so it read as decoration. It is
   // not: when it reaches zero every Mac stops being able to reach every game
-  // port, and the four bays carry on reporting all four servers up -- which
-  // they are. Nothing on the page connected "these are fine" to "and you
-  // cannot reach any of them".
+  // port, and the bays carry on reporting every server up -- which they are.
+  // Nothing on the page connected "these are fine" to "and you cannot reach
+  // any of them".
   function level(s) {
     if (s == null) return '';
     if (s <= 0) return 'gone';
@@ -288,6 +288,6 @@ function updateHealth(h, totalPlayers) {
     const f = totalPlayers / h.seats;
     pushSample('players', f);
     setGauge('players', String(totalPlayers), f, 'of ' + h.seats +
-             ' seats across four servers', 1.1, 1.2);
+             ' seats across five servers', 1.1, 1.2);
   }
 }
